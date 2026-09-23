@@ -3,8 +3,8 @@ from app.models.document import Document
 from app.schemas.document import DocumentCreate, DocumentUpdate
 
 
-def create_document(db: Session, data: DocumentCreate) -> Document:
-    new_doc = Document(filename=data.filename, description=data.description)
+def create_document(db: Session, data: DocumentCreate, owner_id: int) -> Document:
+    new_doc = Document(filename=data.filename, description=data.description, owner_id=owner_id)
     db.add(new_doc)
     db.commit()
     db.refresh(new_doc)
@@ -15,8 +15,8 @@ def get_document(db: Session, document_id: int) -> Document | None:
     return db.query(Document).filter(Document.id == document_id).first()
 
 
-def get_documents(db: Session, skip: int = 0, limit: int = 10) -> list[Document]:
-    return db.query(Document).offset(skip).limit(limit).all()
+def get_documents(db: Session, owner_id: int, skip: int = 0, limit: int = 10) -> list[Document]:
+    return db.query(Document).filter(Document.owner_id == owner_id).offset(skip).limit(limit).all()
 
 
 def update_document(db: Session, document_id: int, data: DocumentUpdate) -> Document | None:
