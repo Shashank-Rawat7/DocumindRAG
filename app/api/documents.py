@@ -9,8 +9,6 @@ from app.crud import document as crud
 
 router = APIRouter()
 
-router = APIRouter()
-
 @router.post("/documents", response_model=DocumentResponse, status_code=201)
 def create_document(
     data: DocumentCreate,
@@ -31,23 +29,49 @@ def list_documents(
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
-def get_document(document_id: int, db: Session = Depends(get_db)):
-    doc = crud.get_document(db, document_id)
+def get_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    doc = crud.get_document(
+        db,
+        document_id,
+        owner_id=current_user.id
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
 
 
 @router.patch("/documents/{document_id}", response_model=DocumentResponse)
-def update_document(document_id: int, data: DocumentUpdate, db: Session = Depends(get_db)):
-    doc = crud.update_document(db, document_id, data)
+def update_document(
+    document_id: int,
+    data: DocumentUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    doc = crud.update_document(
+        db,
+        document_id,
+        data,
+        owner_id=current_user.id
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
 
 
 @router.delete("/documents/{document_id}", status_code=204)
-def delete_document(document_id: int, db: Session = Depends(get_db)):
-    success = crud.delete_document(db, document_id)
+def delete_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    success = crud.delete_document(
+        db,
+        document_id,
+        owner_id=current_user.id
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Document not found")
