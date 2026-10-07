@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     environment: str = "development"
 
     database_url: str
-    secret_key: str = Field(min_length=1)
+    secret_key: str = Field(min_length=32)
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 

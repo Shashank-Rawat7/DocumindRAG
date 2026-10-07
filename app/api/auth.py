@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Depends, HTTPException, Request
+from app.core.rate_limit import limiter
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -11,7 +11,12 @@ router = APIRouter(prefix="/auth")
 
 
 @router.post("/register", response_model=UserResponse, status_code=201)
-def register(data: UserCreate, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def register(
+    request: Request,
+    data: UserCreate,
+    db: Session = Depends(get_db)
+):
     existing = crud.get_user_by_email(db, data.email)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -19,7 +24,12 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=Token)
-def login(credentials: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def login(
+    request: Request,
+    credentials: LoginRequest,
+    db: Session = Depends(get_db)
+):
     user = crud.get_user_by_email(db, credentials.email)
     if not user or not verify_password(credentials.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
