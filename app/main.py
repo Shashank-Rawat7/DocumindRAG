@@ -1,3 +1,4 @@
+from app.core.error_handlers import unhandled_exception_handler
 import logging
 
 logging.basicConfig(
@@ -17,6 +18,8 @@ from app.core.config import settings
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.app_name)
+
+app.add_exception_handler(Exception, unhandled_exception_handler)
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
