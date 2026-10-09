@@ -14,12 +14,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi import FastAPI
 from app.api import health, documents, auth
-from app.core.database import Base, engine
 from app.core.middleware import RequestLoggingMiddleware
 from app.models import document, user
 from app.core.config import settings 
-
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.app_name)
 
