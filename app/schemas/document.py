@@ -1,14 +1,16 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
 from typing import Optional
 
 
 class DocumentCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     filename: str = Field(min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
 
 
 class DocumentUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     filename: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
 

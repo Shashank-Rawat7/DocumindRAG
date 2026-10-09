@@ -1,13 +1,29 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
 
 class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
-    ## In this value gets directly set by unpacking the json body of request by FastAPI
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
 
 class UserResponse(BaseModel):
     id: int
@@ -15,9 +31,6 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-    #In this we are using Config cuz we are getting data from SQLAlchemy Object here so we need
-    # to set from_attributes = True so that it can read the data from SQLAlchemy Object
 
 
 class Token(BaseModel):
