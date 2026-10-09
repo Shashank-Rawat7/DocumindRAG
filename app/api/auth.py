@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.core.rate_limit import limiter
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_user
+from app.models.user import User
 from app.core.database import get_db
 from app.core.security import verify_password, create_access_token
 from app.schemas.user import LoginRequest, UserCreate, UserResponse, Token
@@ -20,7 +22,11 @@ def register(
     existing = crud.get_user_by_email(db, data.email)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-    return crud.create_user(db, data)
+
+    user = crud.create_user(db, data)
+    if user is None:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    return user
 
 
 @router.post("/login", response_model=Token)
@@ -36,3 +42,10 @@ def login(
 
     token = create_access_token(data={"sub": user.email})
     return Token(access_token=token, token_type="bearer")
+
+@router.delete("/me", status_code=204)
+def delete_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    crud.delete_user(db, current_user)

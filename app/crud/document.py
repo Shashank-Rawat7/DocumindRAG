@@ -39,12 +39,13 @@ def get_documents(
     limit: int = 10
 ) -> list[Document]:
     return (
-        db.query(Document)
-        .filter(Document.owner_id == owner_id)
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
+    db.query(Document)
+    .filter(Document.owner_id == owner_id)
+    .order_by(Document.id)
+    .offset(skip)
+    .limit(limit)
+    .all()
+)
 
 
 def update_document(
