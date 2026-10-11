@@ -19,6 +19,8 @@ class DocumentResponse(BaseModel):
     id: int
     filename: str
     description: Optional[str]
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
     created_at: datetime
 
     class Config:

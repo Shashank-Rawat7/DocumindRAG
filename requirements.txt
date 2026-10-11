@@ -27,3 +27,4 @@ bcrypt==4.3.0
 pydantic-settings
 slowapi
 alembic
+python-multipart==0.0.32

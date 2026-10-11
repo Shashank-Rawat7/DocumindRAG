@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from app.models.document import Document
 from app.schemas.document import DocumentCreate, DocumentUpdate
+from app.core import storage
 
 
 def create_document(
@@ -20,6 +21,30 @@ def create_document(
 
     return new_doc
 
+def create_uploaded_document(
+    db: Session,
+    *,
+    filename: str,
+    description: str | None,
+    stored_name: str,
+    content_type: str | None,
+    size_bytes: int,
+    owner_id: int,
+) -> Document:
+    new_doc = Document(
+        filename=filename,
+        description=description,
+        stored_name=stored_name,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        owner_id=owner_id,
+    )
+
+    db.add(new_doc)
+    db.commit()
+    db.refresh(new_doc)
+
+    return new_doc
 
 def get_document(
     db: Session,
@@ -91,7 +116,11 @@ def delete_document(
     if not doc:
         return False
 
+    stored_name = doc.stored_name
+
     db.delete(doc)
     db.commit()
+
+    storage.delete_file(stored_name)
 
     return True

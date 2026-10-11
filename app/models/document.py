@@ -13,6 +13,9 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, nullable=False)
     description = Column(String, nullable=True)
+    stored_name = Column(String, nullable=True)
+    content_type = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
     owner_id = Column(
         Integer,
         ForeignKey("users.id", ondelete="CASCADE", name="fk_documents_owner_id_users"),

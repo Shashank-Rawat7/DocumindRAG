@@ -1,3 +1,5 @@
+from app.core import storage
+from app.models.document import Document
 from sqlalchemy.orm import Session
 from app.models.user import User
 from app.schemas.user import UserCreate
@@ -21,5 +23,15 @@ def create_user(db: Session, data: UserCreate) -> User | None:
     return new_user
 
 def delete_user(db: Session, user: User) -> None:
+    stored_names = [
+        name
+        for (name,) in db.query(Document.stored_name)
+        .filter(Document.owner_id == user.id, Document.stored_name.isnot(None))
+        .all()
+    ]
+
     db.delete(user)
     db.commit()
+
+    for name in stored_names:
+        storage.delete_file(name)

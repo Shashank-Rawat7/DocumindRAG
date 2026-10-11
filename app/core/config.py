@@ -10,7 +10,15 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # File upload settings
+    upload_dir: str = "uploads"
+    max_upload_mb: int = 10
+    allowed_extensions: list[str] = [".pdf", ".txt", ".md", ".docx"]
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8"
+    )
 
 
 settings = Settings()
