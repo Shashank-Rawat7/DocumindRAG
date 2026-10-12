@@ -1,6 +1,6 @@
 from pathlib import Path
-
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from app.core.processing import process_document
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -26,6 +26,7 @@ def create_document(
 @limiter.limit("5/minute")
 def upload_document(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     description: str | None = Form(None, max_length=1000),
     db: Session = Depends(get_db),
@@ -42,7 +43,7 @@ def upload_document(
     clean_description = description.strip() if description else None
 
     try:
-        return crud.create_uploaded_document(
+        doc = crud.create_uploaded_document(
             db,
             filename=display_name,
             description=clean_description or None,
@@ -55,6 +56,9 @@ def upload_document(
         db.rollback()
         storage.delete_file(stored_name)
         raise
+
+    background_tasks.add_task(process_document, doc.id)
+    return doc
 
 
 @router.get("/documents/{document_id}/download")

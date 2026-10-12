@@ -37,6 +37,7 @@ def create_uploaded_document(
         stored_name=stored_name,
         content_type=content_type,
         size_bytes=size_bytes,
+        processing_status="pending",
         owner_id=owner_id,
     )
 
@@ -54,6 +55,14 @@ def get_document(
     return db.query(Document).filter(
         Document.id == document_id,
         Document.owner_id == owner_id
+    ).first()
+
+def get_document_by_id(
+    db: Session,
+    document_id: int,
+) -> Document | None:
+    return db.query(Document).filter(
+        Document.id == document_id
     ).first()
 
 

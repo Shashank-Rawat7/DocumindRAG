@@ -21,6 +21,8 @@ class DocumentResponse(BaseModel):
     description: Optional[str]
     content_type: Optional[str] = None
     size_bytes: Optional[int] = None
+    processing_status: Optional[str] = None
+    processing_error: Optional[str] = None
     created_at: datetime
 
     class Config:

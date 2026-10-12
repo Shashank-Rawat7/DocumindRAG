@@ -20,7 +20,6 @@ uvicorn==0.53.0
 watchfiles==1.2.0
 websockets==17.1
 python-jose[cryptography]
-python-multipart
 email-validator
 passlib[bcrypt]==1.7.4
 bcrypt==4.3.0
@@ -28,3 +27,6 @@ pydantic-settings
 slowapi
 alembic
 python-multipart==0.0.32
+lxml==6.1.3
+pypdf==6.20.0
+python-docx==1.2.0
