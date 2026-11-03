@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
-    "postgresql://documind_user:documind_pass@localhost:5432/documind_test",
+    "postgresql://documind_user:documind_pass@localhost:5434/documind_test",
 )
 
 if not (make_url(TEST_DATABASE_URL).database or "").endswith("_test"):

@@ -1,12 +1,12 @@
 services:
   db:
-    image: postgres:16
+    image: pgvector/pgvector:0.8.7-pg16-trixie@sha256:9cf8b511f0e9a2c209b61430fc139f1ab9c75edbb31fb1751db6617b246a897a
     environment:
       POSTGRES_USER: documind_user
       POSTGRES_PASSWORD: documind_pass
       POSTGRES_DB: documind_db
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
