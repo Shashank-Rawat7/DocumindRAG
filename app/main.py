@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from app.api import health, documents, auth
 from app.core.middleware import RequestLoggingMiddleware
-from app.models import document, user
+from app.models import chunk, document, user
 from app.core.config import settings 
 
 app = FastAPI(title=settings.app_name)

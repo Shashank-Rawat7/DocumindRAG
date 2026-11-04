@@ -2,7 +2,7 @@ from logging.config import fileConfig
 
 from app.core.config import settings
 from app.core.database import Base
-from app.models import document, user  # noqa: F401
+from app.models import chunk, document, user  # noqa: F401
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
