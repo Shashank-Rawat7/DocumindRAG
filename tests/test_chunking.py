@@ -156,6 +156,7 @@ def test_signature_fields_identify_the_chunking_version():
         "token_count_scope": "content_tokens_only",
         "token_assignment": "contiguous_token_range_before_edge_trim",
         "grapheme_segmentation": GRAPHEME_SEGMENTATION,
+        "token_counts": "explicit_per_span_default_one",
     }
     assert GRAPHEME_SEGMENTATION == f"regex-{regex.__version__}-X-uax29-extended-grapheme-clusters"
 
@@ -698,3 +699,230 @@ def test_whitespace_and_format_characters_may_sit_between_tokens():
     text = "hello\u200bworld"  # zero-width space (Cf) between two tokens
     [c] = chunk_text(text, [(0, 5), (6, 11)], SMALL)
     assert c.text == text
+
+
+
+# ---------- weighted spans: token_counts (c2.1-v3) ----------
+
+def running_totals(counts):
+    totals = [0]
+    for count in counts:
+        totals.append(totals[-1] + count)
+    return totals
+
+
+def assert_weighted_invariants(text, spans, counts, chunks, config):
+    """Like assert_invariants, but token_start/token_end are model-token positions."""
+    totals = running_totals(counts)
+    span_at = {t: k for k, t in enumerate(totals)}
+    starts = grapheme_starts(text)
+    covered = [False] * len(text)
+    previous = None
+    for expected_index, c in enumerate(chunks):
+        assert c.index == expected_index
+        assert c.text == text[c.start:c.end] and c.text == c.text.strip() and c.text
+        assert c.span_sha256 == sha256_text(c.text)
+        # chunk edges fall on span boundaries: a weighted unit is never split
+        assert c.token_start in span_at and c.token_end in span_at
+        first, last = span_at[c.token_start], span_at[c.token_end]
+        assert first < last
+        assert c.token_count == c.token_end - c.token_start == sum(counts[first:last])
+        assert 1 <= c.token_count <= config.max_tokens
+        range_start, range_end = spans[first][0], spans[last - 1][1]
+        assert range_start <= c.start and c.end <= range_end
+        assert text[range_start:c.start].strip() == "" and text[c.end:range_end].strip() == ""
+        assert c.start in starts and c.end in starts
+        if previous is not None:
+            assert c.start > previous.start and c.end > previous.end
+            assert c.token_start > previous.token_start and c.token_end > previous.token_end
+            assert 0 <= previous.token_end - c.token_start <= config.overlap_tokens
+        for pos in range(c.start, c.end):
+            covered[pos] = True
+        previous = c
+    if chunks:
+        assert chunks[0].token_start == 0 and chunks[-1].token_end == totals[-1]
+    for pos, ch in enumerate(text):
+        if not ch.isspace():
+            assert covered[pos], f"offset {pos} ({ch!r}) not in any chunk"
+
+
+def test_signature_fields_name_the_token_count_rule():
+    fields = DEFAULT_CHUNKER_CONFIG.signature_fields()
+    assert CHUNKER_VERSION == "c2.1-v3"
+    assert fields["chunker_version"] == "c2.1-v3"
+    assert fields["token_counts"] == "explicit_per_span_default_one"
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_token_counts_none_and_all_ones_give_identical_output(seed):
+    rng = random.Random(seed)
+    text = "".join(rng.choice(ALPHABET) + rng.choice(SEPARATORS) for _ in range(rng.randint(0, 400)))
+    spans = piece_spans(text, rng.choice([1, 2, 3, 5]))
+    target = rng.randint(2, 30)
+    config = ChunkerConfig(
+        target_tokens=target,
+        max_tokens=target + rng.randint(0, 20),
+        overlap_tokens=rng.randint(0, target - 1),
+    )
+    try:
+        expected = chunk_text(text, spans, config)
+    except ChunkingError as exc:
+        with pytest.raises(ChunkingError) as again:
+            chunk_text(text, spans, config, token_counts=[1] * len(spans))
+        assert str(again.value) == str(exc)
+        return
+    assert chunk_text(text, spans, config, token_counts=[1] * len(spans)) == expected
+    assert chunk_text(text, spans, config, token_counts=None) == expected
+
+
+@pytest.mark.parametrize("counts", [
+    [0, 1],
+    [-1, 1],
+    [True, 1],
+    [1.0, 1],
+    ["1", 1],
+    [None, 1],
+    [1],
+    [1, 1, 1],
+    "11",
+    b"\x01\x01",
+    2,
+    {1, 2},
+], ids=["zero", "negative", "bool", "float", "str-item", "none-item", "too-short",
+        "too-long", "str", "bytes", "int", "set"])
+def test_invalid_token_counts_are_rejected(counts):
+    with pytest.raises(ChunkingError):
+        chunk_text("ab cd", [(0, 2), (3, 5)], SMALL, token_counts=counts)
+
+
+def test_token_counts_must_be_keyword_only():
+    with pytest.raises(TypeError):
+        chunk_text("ab", [(0, 2)], SMALL, [1])
+
+
+def test_budgets_are_counted_in_model_tokens():
+    text = words(40)
+    spans = word_spans(text)
+    counts = [2] * len(spans)
+    chunks = chunk_text(text, spans, SMALL, token_counts=counts)
+    assert len(chunks) > 1
+    assert all(c.token_count % 2 == 0 and c.token_count <= SMALL.max_tokens for c in chunks)
+    assert_weighted_invariants(text, spans, counts, chunks, SMALL)
+
+
+@pytest.mark.parametrize("weight, expected", [(1, 10), (2, 10), (3, 9)])
+def test_cut_closest_to_target_is_measured_in_model_tokens(weight, expected):
+    text = words(60)
+    spans = word_spans(text)
+    chunks = chunk_text(text, spans, SMALL, token_counts=[weight] * len(spans))
+    assert chunks[0].token_count == expected     # target 10: candidates are multiples of weight
+
+
+def test_rest_fits_is_measured_in_model_tokens():
+    text = words(7)
+    spans = word_spans(text)
+    [only] = chunk_text(text, spans, SMALL, token_counts=[2] * 7)   # 14 tokens == max_tokens
+    assert (only.token_start, only.token_end, only.token_count) == (0, 14, 14)
+    assert len(chunk_text(words(8), word_spans(words(8)), SMALL, token_counts=[2] * 8)) > 1
+
+
+def test_rest_fits_with_one_heavy_span():
+    text = words(11)
+    spans = word_spans(text)
+    chunks = chunk_text(text, spans, SMALL, token_counts=[1] * 10 + [4])   # 14 tokens in total
+    assert len(chunks) == 1 and chunks[0].token_count == 14
+
+
+def test_span_equal_to_max_tokens_is_a_chunk_on_its_own():
+    config = ChunkerConfig(target_tokens=4, max_tokens=4, overlap_tokens=0)
+    chunks = chunk_text("aaaa bbbb", [(0, 4), (5, 9)], config, token_counts=[4, 4])
+    assert [(c.text, c.token_start, c.token_end) for c in chunks] == [("aaaa", 0, 4), ("bbbb", 4, 8)]
+
+
+@pytest.mark.parametrize("counts", [[5, 1], [1, 5], [1, 1, 9]])
+def test_span_larger_than_max_tokens_is_rejected(counts):
+    config = ChunkerConfig(target_tokens=4, max_tokens=4, overlap_tokens=0)
+    text = " ".join("w" * (k + 1) for k in range(len(counts)))
+    with pytest.raises(ChunkingError, match="more than max_tokens=4"):
+        chunk_text(text, word_spans(text), config, token_counts=counts)
+
+
+def test_single_large_span_is_fine_when_it_is_the_whole_rest():
+    config = ChunkerConfig(target_tokens=4, max_tokens=4, overlap_tokens=0)
+    [only] = chunk_text("word", [(0, 4)], config, token_counts=[4])
+    assert only.token_count == 4
+
+
+def test_overlap_never_exceeds_overlap_tokens_in_model_tokens():
+    rng = random.Random(7)
+    text = words(120)
+    spans = word_spans(text)
+    counts = [rng.choice([1, 2, 3]) for _ in spans]
+    chunks = chunk_text(text, spans, SMALL, token_counts=counts)
+    assert len(chunks) > 3
+    assert_weighted_invariants(text, spans, counts, chunks, SMALL)
+
+
+def test_overlap_shrinks_to_zero_when_units_are_larger_than_the_overlap():
+    config = ChunkerConfig(target_tokens=4, max_tokens=6, overlap_tokens=1)
+    text = words(20)
+    spans = word_spans(text)
+    chunks = chunk_text(text, spans, config, token_counts=[2] * len(spans))
+    for prev, nxt in zip(chunks, chunks[1:]):
+        assert nxt.token_start == prev.token_end     # a 2-token unit cannot fit in 1 token of overlap
+
+
+def test_weighted_unit_is_never_split_between_chunks():
+    # Metaspace-style groups: every span stands for 2 model tokens sharing its characters.
+    text = "\n".join(words(9, prefix=f"l{k}_") for k in range(12))
+    spans = word_spans(text)
+    counts = [2 if k % 3 == 0 else 1 for k in range(len(spans))]
+    totals = set(running_totals(counts))
+    chunks = chunk_text(text, spans, SMALL, token_counts=counts)
+    assert all(c.token_start in totals and c.token_end in totals for c in chunks)
+    assert_weighted_invariants(text, spans, counts, chunks, SMALL)
+
+
+def test_preferred_minimum_is_measured_in_model_tokens():
+    text = "a b\n\n" + words(40)
+    spans = word_spans(text)
+    # "a b" = 2 spans. Weighted 2+2 = 4 tokens: below target // 2 = 5, so the paragraph is skipped.
+    low = chunk_text(text, spans, SMALL, token_counts=[2, 2] + [1] * (len(spans) - 2))
+    assert low[0].text != "a b"
+    # Weighted 3+3 = 6 tokens: inside the preferred range, so the paragraph boundary wins.
+    high = chunk_text(text, spans, SMALL, token_counts=[3, 3] + [1] * (len(spans) - 2))
+    assert high[0].text == "a b" and high[0].token_count == 6
+
+
+def test_token_indices_are_running_totals():
+    text = words(50)
+    spans = word_spans(text)
+    counts = [1, 2, 1, 3] * 12 + [2, 2]
+    totals = running_totals(counts)
+    chunks = chunk_text(text, spans, SMALL, token_counts=counts)
+    assert chunks[0].token_start == 0 and chunks[-1].token_end == totals[-1]
+    covered = set()
+    for c in chunks:
+        covered.update(range(c.token_start, c.token_end))
+    assert covered == set(range(totals[-1]))           # every model token is in some chunk
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_randomised_weighted_documents_keep_every_guarantee(seed):
+    rng = random.Random(1000 + seed)
+    text = "".join(rng.choice(ALPHABET) + rng.choice(SEPARATORS) for _ in range(rng.randint(1, 300)))
+    spans = piece_spans(text, rng.choice([1, 2, 3, 5]))
+    counts = [rng.choice([1, 1, 2]) for _ in spans]
+    target = rng.randint(4, 30)
+    config = ChunkerConfig(
+        target_tokens=target,
+        max_tokens=target + rng.randint(1, 20),
+        overlap_tokens=rng.randint(0, target - 1),
+    )
+    try:
+        first = chunk_text(text, spans, config, token_counts=counts)
+    except ChunkingError as exc:
+        assert str(exc).startswith("no grapheme-safe chunk boundary")
+        return
+    assert chunk_text(text, spans, config, token_counts=counts) == first
+    assert_weighted_invariants(text, spans, counts, first, config)

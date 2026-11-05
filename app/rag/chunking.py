@@ -13,6 +13,12 @@ Input contract (violations raise ChunkingError):
     are rejected), spans are in order and do not overlap.
   * Every character outside all spans is whitespace or a control/format
     character (Unicode categories Cc, Cf, Zs, Zl, Zp); content is never dropped.
+  * ``token_counts`` (optional, keyword-only) gives the number of model tokens
+    each span represents: a sequence of Python ``int`` >= 1, one per span.
+    ``None`` means 1 per span, which is exactly the original C2.1 behaviour.
+    Budgets, overlap and ``token_start``/``token_end`` are counted in model
+    tokens (running totals of ``token_counts``), never in spans; a single span
+    is never split between chunks.
 
 Guarantees for every returned ChunkSpan ``c`` (all verified before returning):
   * ``c.text == text[c.start:c.end]`` (Python code-point indices, half-open).
@@ -34,21 +40,19 @@ is returned. The text is never normalised, collapsed or truncated.
 from __future__ import annotations
 
 import hashlib
-import unicodedata
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Sequence
 
-import regex
+from app.rag.text_boundaries import GRAPHEME_SEGMENTATION, grapheme_boundaries, is_ignorable
 
 # Bump whenever the algorithm changes in a way that can change chunk output.
-CHUNKER_VERSION = "c2.1-v2"
+CHUNKER_VERSION = "c2.1-v3"
 
 SENTENCE_TERMINATORS = frozenset(".!?\u2026\u0964\u0965")  # . ! ? and the ellipsis, danda, double danda
 CLOSING_PUNCTUATION = frozenset("\"')]}\u00bb\u201d\u2019")  # closing quotes and brackets
 
-# Unicode extended grapheme clusters (UAX #29), implemented by the regex package.
-_GRAPHEME_CLUSTER = regex.compile(r"\X")
-GRAPHEME_SEGMENTATION = f"regex-{regex.__version__}-X-uax29-extended-grapheme-clusters"
+# GRAPHEME_SEGMENTATION is re-exported from app.rag.text_boundaries (imported above).
 
 # Ranks of the cut *before* token k (between token k-1 and token k).
 RANK_HARD = 0       # no whitespace at the cut: inside a word / between sub-word pieces
@@ -105,6 +109,7 @@ class ChunkerConfig:
             "overlap_tokens": self.overlap_tokens,
             "token_count_scope": "content_tokens_only",
             "token_assignment": "contiguous_token_range_before_edge_trim",
+            "token_counts": "explicit_per_span_default_one",
             "grapheme_segmentation": GRAPHEME_SEGMENTATION,
         }
 
@@ -124,6 +129,10 @@ class ChunkSpan:
     SentencePiece token " world") are still counted, so the count never
     under-states. It excludes the "passage: " prefix and special tokens; C2.4
     tokenizes the final model input separately and rejects anything over 512.
+
+    ``token_start``/``token_end`` index the model-token sequence (running totals
+    of ``token_counts``). They equal span indices only when every span counts as
+    one token; never use them to index ``token_spans``.
     """
 
     index: int
@@ -140,6 +149,8 @@ def chunk_text(
     text: str,
     token_spans: Sequence[tuple[int, int]],
     config: ChunkerConfig = DEFAULT_CHUNKER_CONFIG,
+    *,
+    token_counts: Sequence[int] | None = None,
 ) -> list[ChunkSpan]:
     """Split ``text`` into overlapping chunks along natural boundaries."""
     if not isinstance(text, str):
@@ -147,17 +158,18 @@ def chunk_text(
     if not isinstance(config, ChunkerConfig):
         raise ChunkingError("config must be a ChunkerConfig")
     spans = _validate_token_spans(text, token_spans)
-    boundaries = _grapheme_boundaries(text)
+    prefix = _token_prefix(token_counts, len(spans))
+    boundaries = grapheme_boundaries(text)
 
     n = len(spans)
     chunks: list[ChunkSpan] = []
     if n == 0:
         return chunks
 
-    i = 0                # first token of the current chunk
-    previous_end = 0     # exclusive end token of the previous chunk
+    i = 0                # first span of the current chunk
+    previous_end = 0     # exclusive end span of the previous chunk
     while True:
-        j = _choose_end(text, spans, boundaries, i, previous_end, config)
+        j = _choose_end(text, spans, boundaries, prefix, i, previous_end, config)
         start, end = _trim(text, spans[i][0], spans[j - 1][1])
         if start < end:
             chunks.append(
@@ -167,17 +179,17 @@ def chunk_text(
                     end=end,
                     text=text[start:end],
                     span_sha256=sha256_text(text[start:end]),
-                    token_start=i,
-                    token_end=j,
-                    token_count=j - i,
+                    token_start=prefix[i],
+                    token_end=prefix[j],
+                    token_count=prefix[j] - prefix[i],
                 )
             )
         if j == n:
             break
-        i = _choose_next_start(text, spans, boundaries, i, j, config)
+        i = _choose_next_start(text, spans, boundaries, prefix, i, j, config)
         previous_end = j
 
-    _check_result(text, spans, boundaries, chunks, config)
+    _check_result(text, spans, boundaries, prefix, chunks, config)
     return chunks
 
 
@@ -205,7 +217,7 @@ def _validate_token_spans(text: str, token_spans) -> list[tuple[int, int]]:
         previous_end = e
         spans.append((s, e))
     for pos, ch in enumerate(text):
-        if not covered[pos] and not _is_ignorable(ch):
+        if not covered[pos] and not is_ignorable(ch):
             raise ChunkingError(
                 f"character U+{ord(ch):04X} at offset {pos} is not covered by any token; "
                 "refusing to drop content"
@@ -213,19 +225,20 @@ def _validate_token_spans(text: str, token_spans) -> list[tuple[int, int]]:
     return spans
 
 
-def _is_ignorable(ch: str) -> bool:
-    """Characters a tokenizer may legitimately leave outside every token."""
-    return ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf", "Zs", "Zl", "Zp")
-
-
-def _grapheme_boundaries(text: str) -> bytearray:
-    """boundaries[p] == 1 iff character offset p starts an extended grapheme
-    cluster (or p == len(text))."""
-    boundaries = bytearray(len(text) + 1)
-    for match in _GRAPHEME_CLUSTER.finditer(text):
-        boundaries[match.start()] = 1
-    boundaries[len(text)] = 1
-    return boundaries
+def _token_prefix(token_counts, n: int) -> list[int]:
+    """Running totals: prefix[k] = model tokens in spans [0, k). len == n + 1."""
+    if token_counts is None:
+        return list(range(n + 1))
+    if isinstance(token_counts, (str, bytes)) or not isinstance(token_counts, Sequence):
+        raise ChunkingError("token_counts must be a sequence of ints")
+    if len(token_counts) != n:
+        raise ChunkingError(f"token_counts has {len(token_counts)} items for {n} spans")
+    prefix = [0]
+    for k, count in enumerate(token_counts):
+        if type(count) is not int or count < 1:
+            raise ChunkingError(f"token_counts[{k}] must be an int >= 1, got {count!r}")
+        prefix.append(prefix[-1] + count)
+    return prefix
 
 
 # ---------- cut points ----------
@@ -290,19 +303,20 @@ def _pick(
     text: str,
     spans: list[tuple[int, int]],
     boundaries: bytearray,
+    prefix: list[int],
     candidates: range,
     ideal: int,
     max_rank: int,
 ) -> int | None:
     """Best grapheme-safe candidate: highest rank (capped at max_rank), then
-    closest to ideal, then the later position."""
+    closest to ideal (a model-token position), then the later position."""
     best: tuple[int, int, int] | None = None
     best_k: int | None = None
     for k in candidates:
         if not _is_safe_cut(text, spans, boundaries, k):
             continue
         rank = min(_boundary_rank(text, spans, k), max_rank)
-        key = (rank, -abs(k - ideal), k)
+        key = (rank, -abs(prefix[k] - ideal), k)
         if best is None or key > best:
             best, best_k = key, k
     return best_k
@@ -312,12 +326,14 @@ def _choose_end(
     text: str,
     spans: list[tuple[int, int]],
     boundaries: bytearray,
+    prefix: list[int],
     i: int,
     previous_end: int,
     config: ChunkerConfig,
 ) -> int:
-    """Exclusive end token index for the chunk starting at token i.
+    """Exclusive end span index for the chunk starting at span i.
 
+    Sizes are model tokens: the chunk [i, k) holds prefix[k] - prefix[i].
     1. If the rest fits in max_tokens, take it all.
     2. Preferred search over sizes [target // 2, max]: best rank, then closest
        to target.
@@ -327,15 +343,22 @@ def _choose_end(
     4. If no grapheme-safe cut exists within max_tokens at all: ChunkingError.
     """
     n = len(spans)
-    if n - i <= config.max_tokens:
+    base = prefix[i]
+    if prefix[n] - base <= config.max_tokens:
         return n  # the rest fits: never leave a small tail
-    hard_end = i + config.max_tokens
-    lowest = max(i + 1, previous_end + 1)  # every chunk must cover a new token
-    ideal = i + config.target_tokens
-    preferred_low = max(lowest, i + config.min_preferred_tokens)
-    k = _pick(text, spans, boundaries, range(preferred_low, hard_end + 1), ideal, RANK_END)
+    hard_end = bisect_right(prefix, base + config.max_tokens) - 1
+    if hard_end <= i:
+        raise ChunkingError(
+            f"span {i} represents {prefix[i + 1] - base} tokens, more than "
+            f"max_tokens={config.max_tokens}"
+        )
+    lowest = max(i + 1, previous_end + 1)  # every chunk must cover a new span
+    ideal = base + config.target_tokens
+    preferred_low = max(lowest, bisect_left(prefix, base + config.min_preferred_tokens))
+    k = _pick(text, spans, boundaries, prefix, range(preferred_low, hard_end + 1), ideal, RANK_END)
     if k is None:
-        k = _pick(text, spans, boundaries, range(lowest, preferred_low), ideal, RANK_END)
+        widened = range(lowest, min(preferred_low, hard_end + 1))
+        k = _pick(text, spans, boundaries, prefix, widened, ideal, RANK_END)
     if k is None:
         raise ChunkingError(
             f"no grapheme-safe chunk boundary within {config.max_tokens} tokens "
@@ -348,18 +371,19 @@ def _choose_next_start(
     text: str,
     spans: list[tuple[int, int]],
     boundaries: bytearray,
+    prefix: list[int],
     i: int,
     j: int,
     config: ChunkerConfig,
 ) -> int:
-    """First token of the next chunk: inside the last overlap_tokens of
-    [i, j), always > i. Falls back to j (no overlap), which is safe because j
-    was itself chosen as a safe cut."""
+    """First span of the next chunk: the overlap [k, j) holds at most
+    overlap_tokens model tokens, and k > i. Falls back to j (no overlap),
+    which is safe because j was itself chosen as a safe cut."""
     if config.overlap_tokens == 0:
         return j
-    lo = max(i + 1, j - config.overlap_tokens)
-    ideal = j - config.overlap_tokens
-    k = _pick(text, spans, boundaries, range(lo, j), ideal, RANK_SENTENCE)
+    ideal = prefix[j] - config.overlap_tokens
+    lo = max(i + 1, bisect_left(prefix, ideal))
+    k = _pick(text, spans, boundaries, prefix, range(lo, j), ideal, RANK_SENTENCE)
     return j if k is None else k
 
 
@@ -377,9 +401,11 @@ def _check_result(
     text: str,
     spans: list[tuple[int, int]],
     boundaries: bytearray,
+    prefix: list[int],
     chunks: list[ChunkSpan],
     config: ChunkerConfig,
 ) -> None:
+    span_at_token = {tokens: k for k, tokens in enumerate(prefix)}  # running total -> span index
     covered = bytearray(len(text))
     previous: ChunkSpan | None = None
     for c in chunks:
@@ -387,11 +413,14 @@ def _check_result(
             raise ChunkingError(f"chunk {c.index} is not an exact trimmed slice")
         if c.span_sha256 != sha256_text(c.text):
             raise ChunkingError(f"chunk {c.index} has a wrong span_sha256")
-        if not 0 <= c.token_start < c.token_end <= len(spans):
+        if not 0 <= c.token_start < c.token_end <= prefix[-1]:
             raise ChunkingError(f"chunk {c.index} has an invalid token range")
         if c.token_count != c.token_end - c.token_start or c.token_count > config.max_tokens:
             raise ChunkingError(f"chunk {c.index} has an invalid token_count")
-        if (c.start, c.end) != _trim(text, spans[c.token_start][0], spans[c.token_end - 1][1]):
+        first, last = span_at_token.get(c.token_start), span_at_token.get(c.token_end)
+        if first is None or last is None:
+            raise ChunkingError(f"chunk {c.index} token range does not fall on span boundaries")
+        if (c.start, c.end) != _trim(text, spans[first][0], spans[last - 1][1]):
             raise ChunkingError(f"chunk {c.index} does not match its token range")
         if not (boundaries[c.start] and boundaries[c.end]):
             raise ChunkingError(
@@ -408,5 +437,5 @@ def _check_result(
         covered[c.start:c.end] = b"\x01" * (c.end - c.start)
         previous = c
     for pos, ch in enumerate(text):
-        if not covered[pos] and not _is_ignorable(ch):
+        if not covered[pos] and not is_ignorable(ch):
             raise ChunkingError(f"character at offset {pos} is not in any chunk")
