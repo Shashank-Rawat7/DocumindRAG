@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # Inputs per forward pass. 1 was chosen from the C2.3d CPU benchmark
     # (within 10% of the best English and Hindi throughput, no padding waste).
     embedding_batch_size: int = Field(default=1, ge=1)
+    # Indexing lease (C5). A worker that claims a document holds it for this long;
+    # once it expires, another worker may take the document over. Builds are not
+    # heart-beaten in V1, so this must exceed the slowest expected build.
+    indexing_lease_minutes: int = Field(default=15, ge=1)
 
     model_config = SettingsConfigDict(
         env_file=".env",

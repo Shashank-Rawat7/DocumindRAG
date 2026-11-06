@@ -85,8 +85,10 @@ class Document(Base):
     indexing_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
 
     # --- Component 12: last successful publication ---
-    # Written only by a successful publish. A failed attempt leaves these values,
-    # source_sha256 and the published chunks untouched.
+    # Written only by a successful publish. A failed attempt keeps these values,
+    # source_sha256 and the published chunks only while that publication is still
+    # valid for the current text; an invalid one is discarded (chunks deleted, these
+    # columns and source_sha256 set to NULL).
     indexed_source_version = Column(Integer, nullable=True)
     indexed_signature = Column(String, nullable=True)
     indexed_embedding_id = Column(String, nullable=True)
