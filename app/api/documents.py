@@ -1,16 +1,28 @@
 from pathlib import Path
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from app.core.processing import process_document
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core import storage
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.processing import process_document
 from app.core.rate_limit import limiter
-from app.models.user import User
-from app.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from app.crud import document as crud
+from app.models.user import User
+from app.rag.indexing_hook import index_after_extraction
+from app.schemas.document import DocumentCreate, DocumentResponse, DocumentUpdate
 
 router = APIRouter()
 
@@ -58,6 +70,10 @@ def upload_document(
         raise
 
     background_tasks.add_task(process_document, doc.id)
+
+    # Runs after extraction; the hook handles extraction-status gating.
+    background_tasks.add_task(index_after_extraction, doc.id)
+
     return doc
 
 

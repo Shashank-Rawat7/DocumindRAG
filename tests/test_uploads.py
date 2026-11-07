@@ -4,11 +4,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api import documents as documents_api
 from app.core import storage
 from app.core.config import settings
+from app.core.database import SessionLocal
 from app.crud import document as crud_document
 from app.main import app
 from app.models.document import Document
+from app.rag import indexing_hook
+from app.rag.indexing_runner import IndexingRunResult, RunOutcome
 
 DOCUMENTS = "/api/v1/documents"
 UPLOAD = f"{DOCUMENTS}/upload"
@@ -387,6 +391,58 @@ def test_file_is_removed_when_saving_the_document_row_fails(
     assert stored_files(tmp_path) == []
     assert db.query(Document).count() == 0
 
+# ---------- automatic indexing hook ----------
+
+def test_upload_runs_process_document_then_the_indexing_hook_for_the_same_document(
+    client, auth_headers, monkeypatch
+):
+    events = []
+    real_process_document = documents_api.process_document
+
+    def recording_process_document(document_id):
+        real_process_document(document_id)
+        events.append(("process_document", document_id))
+
+    def recording_hook(document_id):
+        with SessionLocal() as session:
+            document = session.get(Document, document_id)
+            events.append(("hook", document_id, document.processing_status, document.extracted_text))
+
+    monkeypatch.setattr(documents_api, "process_document", recording_process_document)
+    monkeypatch.setattr(documents_api, "index_after_extraction", recording_hook)
+
+    response = upload(client, auth_headers, content=b"hello world")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert set(body) == RESPONSE_FIELDS and body["processing_status"] == "pending"
+    assert events == [
+        ("process_document", body["id"]),
+        ("hook", body["id"], "completed", "hello world"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "content, expected_runs, expected_indexing_status",
+    [(b"hello world", 1, "pending"), (b"", 0, None)],
+    ids=["extraction-completed", "extraction-failed"],
+)
+def test_the_real_hook_queues_only_documents_whose_extraction_completed(
+    client, auth_headers, db, monkeypatch, content, expected_runs, expected_indexing_status
+):
+    runs = []
+
+    def spy_run_indexing(document_id):
+        runs.append(document_id)
+        return IndexingRunResult(document_id=document_id, outcome=RunOutcome.NOT_CLAIMED)
+
+    monkeypatch.setattr(documents_api, "index_after_extraction", indexing_hook.index_after_extraction)
+    monkeypatch.setattr(indexing_hook, "run_indexing", spy_run_indexing)
+
+    document_id = upload(client, auth_headers, content=content).json()["id"]
+
+    assert runs == ([document_id] if expected_runs else [])
+    assert db.get(Document, document_id).indexing_status == expected_indexing_status
 
 # ---------- storage module ----------
 

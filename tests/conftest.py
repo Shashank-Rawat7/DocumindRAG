@@ -26,8 +26,9 @@ os.environ["ENVIRONMENT"] = "test"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.api import documents as documents_api
 from app.core import storage  # noqa: E402
-from app.core.database import SessionLocal, engine # noqa: E402
+from app.core.database import SessionLocal, engine  # noqa: E402
 from app.core.rate_limit import limiter  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -95,6 +96,22 @@ def _limiter_off():
 @pytest.fixture(autouse=True)
 def _upload_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "UPLOAD_ROOT", tmp_path.resolve())
+
+
+def _no_auto_indexing_hook(document_id: int) -> None:
+    """Stand-in for the upload endpoint's indexing hook: does nothing at all."""
+
+
+@pytest.fixture(autouse=True)
+def _no_auto_indexing(monkeypatch):
+    # Uploads must not queue or run indexing (which would load the real embedding
+    # model) in tests. Only the endpoint's reference is replaced: the hook module
+    # and the C5.1/C5.2 code are untouched, so their tests exercise the real code.
+    # A test that wants the real hook sets the attribute back itself; its
+    # monkeypatch call runs after this fixture, so it wins.
+    # Strict on purpose (no raising=False): if the endpoint's import is renamed, every test
+    # fails loudly instead of this fixture silently stopping to protect them.
+    monkeypatch.setattr(documents_api, "index_after_extraction", _no_auto_indexing_hook)
 
 
 @pytest.fixture
