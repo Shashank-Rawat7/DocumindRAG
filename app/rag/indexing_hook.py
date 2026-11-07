@@ -28,10 +28,18 @@ taken over.
 
 Failure handling. The function never raises an ordinary Exception: the upload
 response has long been sent and there is nobody to receive it. KeyboardInterrupt,
-SystemExit and other BaseException propagate, as in the runner. No session is open
-while run_indexing works. Logs hold ids, enum names, counts, the exception class
-name and frame metadata only: never exception messages, SQL parameters or document
-text.
+SystemExit and other BaseException propagate, as in the runner. The hook holds no session
+while run_indexing works; the runner manages its own sessions. Logs hold ids, enum names,
+counts, the exception class name and frame metadata only: never exception messages,
+SQL parameters or document text.
+
+Manual indexing (C5.4.2). ``run_requested_indexing`` is the background task of
+POST /documents/{id}/indexing. That endpoint has already queued the document with
+request_indexing, so the wrapper calls run_indexing only: it never requeues and opens
+no session itself. The runner manages its own sessions. run_indexing claims only a
+'pending' row, so a task that starts late finds nothing to claim and does not publish
+again. Failure handling is the same as above, and its log messages say
+"Requested indexing" so manual runs can be told apart from upload-triggered ones.
 """
 from __future__ import annotations
 
@@ -86,6 +94,29 @@ def index_after_extraction(document_id: int) -> None:
 
 
 
+def run_requested_indexing(document_id: int) -> None:
+    """Run one indexing attempt for a document the manual endpoint just queued.
+
+    Calls run_indexing only. The endpoint has already moved the document to 'pending'
+    with request_indexing, and run_indexing claims only a 'pending' row, so a task that
+    starts late finds nothing to claim (NOT_CLAIMED) and does not publish again. This
+    function never requeues and opens no session itself. The runner manages its own
+    sessions. Never raises an ordinary Exception; BaseException propagates.
+    """
+    try:
+        result = run_indexing(document_id)
+        _log_requested_result(result)
+    # Background-task boundary: the response has long been sent.
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Requested indexing failed | document_id=%s error_type=%s frames=%s",
+            document_id,
+            type(exc).__name__,
+            _frames(exc),
+        )
+
+
+
 def _request(document_id: int) -> bool:
     """request_indexing in its own session, closed before this function returns.
 
@@ -113,6 +144,18 @@ def _log_result(result: IndexingRunResult) -> None:
     logger.log(
         _RESULT_LOG_LEVELS.get(result.outcome, logging.WARNING),
         "Automatic indexing finished | document_id=%s outcome=%s attempt=%s chunks=%s reason=%s failure=%s",
+        result.document_id,
+        result.outcome.value,
+        result.attempt,
+        result.chunk_count,
+        result.reason.name if result.reason is not None else "-",
+        result.failure_outcome.name if result.failure_outcome is not None else "-",
+    )
+
+def _log_requested_result(result: IndexingRunResult) -> None:
+    logger.log(
+        _RESULT_LOG_LEVELS.get(result.outcome, logging.WARNING),
+        "Requested indexing finished | document_id=%s outcome=%s attempt=%s chunks=%s reason=%s failure=%s",
         result.document_id,
         result.outcome.value,
         result.attempt,

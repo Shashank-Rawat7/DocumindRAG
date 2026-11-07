@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -33,3 +33,17 @@ class IndexingStatusResponse(BaseModel):
     index_current: bool
     published_chunks_present: bool
     in_progress: bool
+
+
+class IndexingRequestResponse(BaseModel):
+    """What POST /documents/{id}/indexing did, plus the state it left behind.
+
+    * ``queued``: this request moved the document to 'pending' and scheduled a run.
+      The state usually still reads 'pending': the run starts after the response.
+    * ``already_running``: a claim with a live lease exists; nothing was written.
+    * ``already_indexed``: the document is indexed, error-free, current, with chunks
+      present; nothing was written.
+    """
+
+    outcome: Literal["queued", "already_running", "already_indexed"]
+    indexing: IndexingStatusResponse

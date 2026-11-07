@@ -570,3 +570,201 @@ def test_no_session_or_connection_is_left_after_a_full_run(embedder, monkeypatch
 
     assert tracker.all_closed and tracker.pool_is_back_to_baseline
     assert row_of(document_id).indexing_status == "indexed"
+
+# ---------- manual wrapper: run_requested_indexing (C5.4.2) ----------
+
+REQUESTED_FINISHED = "Requested indexing finished"
+REQUESTED_FAILED = "Requested indexing failed"
+
+
+def test_the_manual_wrapper_calls_only_the_runner(monkeypatch):
+    steps = patch_steps(monkeypatch, result=result_for(RunOutcome.PUBLISHED))
+    tracker = SessionTracker(monkeypatch)
+
+    assert hook.run_requested_indexing(7) is None
+
+    assert steps == [("run", 7)]   # request_indexing is never called
+    assert tracker.records == []   # and the wrapper opens no session of its own
+
+
+@pytest.mark.parametrize("outcome, level", OUTCOME_LEVELS, ids=[o.value for o, _ in OUTCOME_LEVELS])
+def test_each_manual_outcome_is_logged_once_at_its_level_with_the_manual_prefix(
+    monkeypatch, capture_logs, outcome, level
+):
+    patch_steps(monkeypatch, result=result_for(outcome))
+
+    assert hook.run_requested_indexing(7) is None
+
+    [record] = hook_records(capture_logs, REQUESTED_FINISHED)
+    message = record.getMessage()
+    assert record.levelno == level
+    assert "document_id=7" in message and f"outcome={outcome.value}" in message
+    assert not hook_records(capture_logs, FINISHED)  # never the automatic prefix
+    assert not hook_records(capture_logs, FAILED_MESSAGE)
+    assert not hook_records(capture_logs, REQUESTED_FAILED)
+    assert_no_secrets(capture_logs)
+
+
+@pytest.mark.parametrize(
+    "outcome, failure_text",
+    [(RunOutcome.FAILED, "failure=FAILED"), (RunOutcome.FAILURE_NOT_RECORDED, "failure=-")],
+    ids=["failed", "failure-not-recorded"],
+)
+def test_manual_failed_results_log_the_reason_and_failure_names(
+    monkeypatch, capture_logs, outcome, failure_text
+):
+    result = result_for(outcome)
+    patch_steps(monkeypatch, result=result)
+
+    hook.run_requested_indexing(7)
+
+    [record] = hook_records(capture_logs, REQUESTED_FINISHED)
+    message = record.getMessage()
+    assert f"reason={result.reason.name}" in message and failure_text in message
+
+
+def test_a_manual_outcome_without_a_configured_level_is_logged_as_a_warning(monkeypatch, capture_logs):
+    patch_steps(monkeypatch, result=result_for(RunOutcome.PUBLISHED))
+    monkeypatch.setattr(hook, "_RESULT_LOG_LEVELS", {})  # the shared table drives both logs
+
+    hook.run_requested_indexing(7)
+
+    [record] = hook_records(capture_logs, REQUESTED_FINISHED)
+    assert record.levelno == logging.WARNING
+
+
+@pytest.mark.parametrize(
+    "make_error, error_type",
+    [
+        (lambda: RuntimeError("secret-boom"), "RuntimeError"),
+        (db_error, "OperationalError"),
+    ],
+    ids=["unexpected", "database"],
+)
+
+
+def test_an_ordinary_runner_exception_in_the_manual_wrapper_is_logged_without_details(
+    monkeypatch, capture_logs, make_error, error_type
+):
+    steps = patch_steps(monkeypatch, run_error=make_error())
+
+    assert hook.run_requested_indexing(7) is None
+
+    assert steps == [("run", 7)]
+    [record] = hook_records(capture_logs, REQUESTED_FAILED)
+    message = record.getMessage()
+    assert record.levelno == logging.ERROR and "document_id=7" in message
+    assert f"error_type={error_type}" in message and "frames=" in message
+    assert not hook_records(capture_logs, REQUESTED_FINISHED)
+    assert not hook_records(capture_logs, FAILED_MESSAGE)
+    assert_no_secrets(capture_logs)
+
+
+def test_an_invalid_runner_result_in_the_manual_wrapper_is_logged_without_raising(monkeypatch, capture_logs):
+    patch_steps(monkeypatch, result=None)
+
+    assert hook.run_requested_indexing(7) is None
+
+    [record] = hook_records(capture_logs, REQUESTED_FAILED)
+    assert record.levelno == logging.ERROR and "error_type=AttributeError" in record.getMessage()
+    assert not hook_records(capture_logs, REQUESTED_FINISHED)
+    assert_no_secrets(capture_logs)
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, SystemExit], ids=["keyboard-interrupt", "system-exit"])
+def test_base_exceptions_propagate_from_the_manual_wrapper(monkeypatch, capture_logs, error):
+    steps = patch_steps(monkeypatch, run_error=error())
+
+    with pytest.raises(error):
+        hook.run_requested_indexing(7)
+
+    assert steps == [("run", 7)]
+    assert not hook_records(capture_logs, REQUESTED_FAILED)
+    assert not hook_records(capture_logs, REQUESTED_FINISHED)
+
+
+# --- isolation: neither path may use the other's logger or prefix ---
+@pytest.mark.parametrize("scenario", ["finished", "failed"])
+def test_the_automatic_hook_keeps_its_own_session_and_logging_and_never_uses_the_manual_prefixes(
+    monkeypatch, capture_logs, scenario
+):
+    if scenario == "finished":
+        steps = patch_steps(monkeypatch, result=result_for(RunOutcome.PUBLISHED))
+        own_prefix = FINISHED
+    else:
+        steps = patch_steps(monkeypatch, run_error=RuntimeError("secret-boom"))
+        own_prefix = FAILED_MESSAGE
+    tracker = SessionTracker(monkeypatch)
+
+    assert hook.index_after_extraction(7) is None
+
+    assert steps == [("request", 7), ("run", 7)]
+    assert len(tracker.records) == 1 and tracker.all_closed and tracker.pool_is_back_to_baseline
+    assert len(hook_records(capture_logs, own_prefix)) == 1
+    assert not hook_records(capture_logs, "Requested indexing")
+    assert_no_secrets(capture_logs)
+
+
+# --- end to end: the manual wrapper with the real runner, real database, fake embedder ---
+
+def test_the_manual_wrapper_publishes_a_pending_document(embedder, capture_logs):
+    document_id = make_document(indexing_status="pending")
+
+    assert hook.run_requested_indexing(document_id) is None
+
+    row = row_of(document_id)
+    assert row.indexing_status == "indexed" and row.indexing_attempt == 1
+    assert row.indexing_error is None and row.indexing_lease_expires_at is None
+    assert row.indexed_embedding_id == FakeEmbedder.embedding_id
+    assert len(chunk_texts(document_id)) >= 2
+    [record] = hook_records(capture_logs, REQUESTED_FINISHED)
+    assert record.levelno == logging.INFO and "outcome=published" in record.getMessage()
+    assert not hook_records(capture_logs, FINISHED)
+    assert "word0001" not in capture_logs.text
+
+
+def test_the_manual_wrapper_does_not_queue_a_never_queued_document(embedder, capture_logs):
+    document_id = make_document()  # extraction completed, indexing_status NULL
+
+    assert hook.run_requested_indexing(document_id) is None
+
+    row = row_of(document_id)
+    assert row.indexing_status is None and row.indexing_attempt == 0
+    assert chunk_texts(document_id) == []
+    assert embedder.calls == []
+    [record] = hook_records(capture_logs, REQUESTED_FINISHED)
+    assert record.levelno == logging.INFO and "outcome=not_claimed" in record.getMessage()
+
+
+def test_a_late_manual_task_does_not_republish_an_indexed_document(embedder, capture_logs):
+    # The automatic hook republishes on a second call (see the "not an index-once guard"
+    # test above). The manual wrapper must not: it never requeues, so a late task finds
+    # nothing 'pending' to claim.
+    document_id = make_document(indexing_status="pending")
+    hook.run_requested_indexing(document_id)  # the first run publishes
+    after_first = (row_of(document_id), chunk_texts(document_id), len(embedder.calls))
+
+    hook.run_requested_indexing(document_id)  # a late duplicate task
+
+    assert (row_of(document_id), chunk_texts(document_id), len(embedder.calls)) == after_first
+    first, second = hook_records(capture_logs, REQUESTED_FINISHED)
+    assert "outcome=published" in first.getMessage()
+    assert "outcome=not_claimed" in second.getMessage()
+
+
+def test_a_manual_embedder_failure_is_recorded_by_the_runner_and_does_not_raise(monkeypatch, capture_logs):
+    error = EmbedderUnavailableError("secret-boom")
+    monkeypatch.setattr(runner, "get_embedder", lambda: FakeEmbedder(embed_error=error))
+    document_id = make_document(indexing_status="pending")
+
+    assert hook.run_requested_indexing(document_id) is None
+
+    row = row_of(document_id)
+    assert row.indexing_status == "failed" and row.indexing_attempt == 1
+    assert row.indexing_error == svc.classify_failure(error).value
+    assert row.indexing_lease_expires_at is None
+    assert chunk_texts(document_id) == []
+    [record] = hook_records(capture_logs, REQUESTED_FINISHED)
+    assert record.levelno == logging.WARNING and "outcome=failed" in record.getMessage()
+    assert not hook_records(capture_logs, REQUESTED_FAILED)
+    assert "secret-boom" not in capture_logs.text
