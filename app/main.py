@@ -13,7 +13,7 @@ logging.basicConfig(
 from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi import FastAPI
-from app.api import health, documents, auth
+from app.api import health, documents, auth, indexing
 from app.core.middleware import RequestLoggingMiddleware
 from app.models import chunk, document, user
 from app.core.config import settings 
@@ -38,3 +38,4 @@ app.add_middleware(
 app.include_router(health.router, prefix="/api/v1", tags=["health"])
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
+app.include_router(indexing.router, prefix="/api/v1", tags=["indexing"])
