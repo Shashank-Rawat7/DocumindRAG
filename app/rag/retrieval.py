@@ -1,19 +1,37 @@
-"""Retrieval contract (Component 12 / C6.1): types, limits and validation.
+"""Retrieval (Component 12 / C6): contract, validation and exact vector search.
 
-Pure: no database access and no model loading. The SQL arrives in C6.2 and the
-query-embedding wrapper in C6.3. No message raised here contains document text
-or query text.
+C6.1 defines the types, limits and argument validation. C6.2 adds
+``retrieve_chunks``: one read-only SELECT that joins document_chunks to
+documents, always filters on the owner, applies ``retrievable_filter`` and ranks
+by exact cosine distance. The query-embedding wrapper arrives in C6.3.
+
+Rules that hold for every call:
+  * Ownership is mandatory and independent of ``document_ids``, which can only
+    narrow the result.
+  * Only published chunks are returned; the publication rules live in
+    ``indexing_service.retrievable_filter``.
+  * The call never begins, commits or rolls back a transaction.
+  * A row that fails verification aborts the whole call; no partial list is
+    ever returned.
+  * No message raised here contains document text or query text.
 """
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
+from sqlalchemy import Select, select
+from sqlalchemy.orm import Session
 
+from app.models.chunk import DocumentChunk
+from app.models.document import Document
 from app.rag.chunking import sha256_text
 from app.rag.embedder import EMBEDDING_DIM, NORM_TOLERANCE
+from app.rag.indexing_service import retrievable_filter
 
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 20
@@ -146,3 +164,122 @@ def validate_source_sha256(source_sha256: str) -> str:
             "source_sha256 must be a lowercase SHA-256 hex digest"
         )
     return source_sha256
+
+
+
+# ---------- retrieval ----------
+
+def _build_retrieval_statement(
+    *,
+    owner_id: int,
+    query_vector: np.ndarray,
+    embedding_id: str,
+    top_k: int,
+    document_ids: tuple[int, ...] | None,
+) -> Select:
+    """The single retrieval SELECT. Pure: it builds SQL and never touches a database.
+
+    Arguments must already be validated. The owner predicate belongs to the base
+    statement; ``document_ids`` can only add a further AND.
+    """
+    distance = DocumentChunk.embedding.cosine_distance(query_vector).label("distance")
+    statement = (
+        select(
+            DocumentChunk.id.label("chunk_id"),
+            DocumentChunk.document_id,
+            DocumentChunk.chunk_index,
+            DocumentChunk.start_offset,
+            DocumentChunk.end_offset,
+            DocumentChunk.page_start,
+            DocumentChunk.page_end,
+            DocumentChunk.text,
+            DocumentChunk.span_sha256,
+            distance,
+            Document.indexed_source_version.label("source_version"),
+            Document.source_sha256,
+        )
+        .select_from(DocumentChunk)
+        .join(Document, Document.id == DocumentChunk.document_id)
+        .where(Document.owner_id == owner_id, retrievable_filter(embedding_id))
+    )
+    if document_ids is not None:
+        statement = statement.where(Document.id.in_(document_ids))
+    return statement.order_by(
+        distance, DocumentChunk.document_id, DocumentChunk.chunk_index
+    ).limit(top_k)
+
+
+def _stored_source_sha256(chunk_id: int, value: Any) -> str:
+    """A stored documents.source_sha256 that is present and well formed.
+
+    Reuses validate_source_sha256 (the one definition of "well formed") but
+    reports a bad stored value as an integrity failure, not as a caller error.
+    """
+    try:
+        return validate_source_sha256(value)
+    except RetrievalRequestError:
+        raise RetrievalIntegrityError(chunk_id, "source_sha256") from None
+
+
+def _row_to_chunk(row: Any) -> RetrievedChunk:
+    """Verify one result row and turn it into a RetrievedChunk.
+
+    Fail closed: the first failed check raises RetrievalIntegrityError.
+    """
+    verify_chunk_integrity(
+        chunk_id=row.chunk_id,
+        text=row.text,
+        start_offset=row.start_offset,
+        end_offset=row.end_offset,
+        span_sha256=row.span_sha256,
+    )
+    source_sha256 = _stored_source_sha256(row.chunk_id, row.source_sha256)
+    distance = row.distance
+    if distance is None or not math.isfinite(distance):
+        raise RetrievalIntegrityError(row.chunk_id, "distance")
+    return RetrievedChunk(
+        chunk_id=row.chunk_id,
+        document_id=row.document_id,
+        chunk_index=row.chunk_index,
+        start_offset=row.start_offset,
+        end_offset=row.end_offset,
+        page_start=row.page_start,
+        page_end=row.page_end,
+        text=row.text,
+        span_sha256=row.span_sha256,
+        score=1.0 - float(distance),
+        source_version=row.source_version,
+        source_sha256=source_sha256,
+    )
+
+
+def retrieve_chunks(
+    db: Session,
+    *,
+    owner_id: int,
+    query_vector: np.ndarray,
+    embedding_id: str,
+    top_k: int = DEFAULT_TOP_K,
+    document_ids: Sequence[int] | None = None,
+) -> list[RetrievedChunk]:
+    """The owner's published chunks nearest to ``query_vector``, best first.
+
+    One read-only SELECT in the caller's transaction: this function never
+    begins, commits or rolls back. Database errors propagate unchanged.
+    """
+    owner_id = validate_owner_id(owner_id)
+    top_k = validate_top_k(top_k)
+    embedding_id = validate_embedding_id(embedding_id)
+    query_vector = validate_query_vector(query_vector)
+    ids = normalize_document_ids(document_ids)
+    if ids is not None and not ids:
+        return []
+    statement = _build_retrieval_statement(
+        owner_id=owner_id,
+        query_vector=query_vector,
+        embedding_id=embedding_id,
+        top_k=top_k,
+        document_ids=ids,
+    )
+    rows = db.execute(statement).all()
+    return [_row_to_chunk(row) for row in rows]
