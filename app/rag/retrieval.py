@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from app.models.chunk import DocumentChunk
 from app.models.document import Document
 from app.rag.chunking import sha256_text
-from app.rag.embedder import EMBEDDING_DIM, NORM_TOLERANCE
+from app.rag.embedder import EMBEDDING_DIM, NORM_TOLERANCE, get_embedder
 from app.rag.indexing_service import retrievable_filter
 
 DEFAULT_TOP_K = 5
@@ -283,3 +283,35 @@ def retrieve_chunks(
     )
     rows = db.execute(statement).all()
     return [_row_to_chunk(row) for row in rows]
+
+def retrieve_for_query(
+    db: Session,
+    *,
+    owner_id: int,
+    query: str,
+    embedder: Any = None,
+    top_k: int = DEFAULT_TOP_K,
+    document_ids: Sequence[int] | None = None,
+) -> list[RetrievedChunk]:
+    """Embed ``query`` and return the owner's nearest published chunks, best first.
+
+    The query is embedded before the database is touched. Embedder errors
+    propagate unchanged. No transaction control: see retrieve_chunks.
+    """
+    validated_query = validate_query_text(query)
+    owner_id = validate_owner_id(owner_id)
+    top_k = validate_top_k(top_k)
+    ids = normalize_document_ids(document_ids)
+    if ids is not None and not ids:
+        return []
+    resolved = embedder if embedder is not None else get_embedder()
+    embedding_id = validate_embedding_id(resolved.embedding_id)
+    query_vector = resolved.embed_query(validated_query)
+    return retrieve_chunks(
+        db,
+        owner_id=owner_id,
+        query_vector=query_vector,
+        embedding_id=embedding_id,
+        top_k=top_k,
+        document_ids=ids,
+    )
