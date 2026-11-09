@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.models.chunk import DocumentChunk
 from app.models.document import Document
+from app.models.user import User  # noqa: F401  (registers the mapper that Document.owner refers to)
 from app.rag.backfill import DocumentState, LeaseState, SourceStatus, is_pdf_like
 
 _LEASE_NONE = LeaseState.NONE.value
