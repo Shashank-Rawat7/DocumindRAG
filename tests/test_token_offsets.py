@@ -7,10 +7,12 @@ are skipped otherwise; nothing is ever downloaded).
 import dataclasses
 import os
 import random
+import unicodedata
 from pathlib import Path
 
 import pytest
 
+from app.rag import token_offsets
 from app.rag.chunking import DEFAULT_CHUNKER_CONFIG, ChunkerConfig, chunk_text
 from app.rag.text_boundaries import GRAPHEME_SEGMENTATION
 from app.rag.token_offsets import (
@@ -41,10 +43,10 @@ def reject(text, offsets, tokens):
 # ---------- identity ----------
 
 def test_signature_fields():
-    assert OFFSET_MAPPING_VERSION == "om-v1"
+    assert OFFSET_MAPPING_VERSION == "om-v2"
     assert signature_fields() == {
-        "offset_mapping_version": "om-v1",
-        "overlap_rule": "metaspace_prefix_same_start",
+        "offset_mapping_version": "om-v2",
+        "overlap_rule": "metaspace_prefix_same_start+ligature_fb01_fb02_continuation",
         "zero_length_offsets": "reject",
         "grapheme_expansion": "same_cluster_extenders_only",
         "grapheme_segmentation": GRAPHEME_SEGMENTATION,
@@ -75,8 +77,24 @@ def test_results_are_immutable():
     ("a  b", [(0, 1), (1, 3), (3, 4)], ["a", "  ", "b"], [(0, 1, 1, 0), (1, 3, 1, 1), (3, 4, 1, 2)], 0),
     # tokens list may be a tuple and offsets may be lists
     ("ab", ([0, 1], [1, 2]), ("a", "b"), [(0, 1, 1, 0), (1, 2, 1, 1)], 0),
+        # a ligature split between two tokens: the continuation extends the unit (token_count 2)
+    ("de\ufb01ne", [(0, 3), (2, 5)], [M + "def", "ine"], [(0, 5, 2, 0)], 0),
+    ("de\ufb02ne", [(0, 3), (2, 5)], [M + "def", "lne"], [(0, 5, 2, 0)], 0),
+    ("abc\ufb01de,", [(0, 4), (3, 6), (6, 7)], [M + "abcf", "ide", ","], [(0, 6, 2, 0), (6, 7, 1, 2)], 0),
+    ("abc\ufb02de,", [(0, 4), (3, 6), (6, 7)], [M + "abcf", "lde", ","], [(0, 6, 2, 0), (6, 7, 1, 2)], 0),
+    ("ab de\ufb01ne", [(0, 2), (3, 6), (5, 8)], [M + "ab", M + "def", "ine"], [(0, 2, 1, 0), (3, 8, 2, 1)], 0),
+    ("de\ufb01ne x", [(0, 3), (2, 5), (6, 7)], [M + "def", "ine", "x"], [(0, 5, 2, 0), (6, 7, 1, 2)], 0),
+    # two isolated ligature splits in one text (not adjacent)
+    ("de\ufb01ne ab\ufb02cd", [(0, 3), (2, 5), (6, 9), (8, 11)], [M + "def", "ine", M + "abf", "lcd"],
+     [(0, 5, 2, 0), (6, 11, 2, 2)], 0),
+    # after an ordinary Metaspace pair
+    ("de\ufb01ne", [(0, 1), (0, 3), (2, 5)], [M, "def", "ine"], [(0, 5, 3, 0)], 1),
 ], ids=["empty", "single", "metaspace-middle", "metaspace-start", "metaspace-devanagari",
-        "metaspace-on-space", "whitespace-token", "list-and-tuple-inputs"])
+        "metaspace-on-space", "whitespace-token", "list-and-tuple-inputs",
+        "ligature-fb01", "ligature-fb02", "ligature-fb01-observed-geometry",
+        "ligature-fb02-observed-geometry", "ligature-mid-text", "ligature-then-unit",
+        "ligature-two-isolated", "ligature-after-metaspace-pair"])
+
 def test_accepted_offsets(text, offsets, tokens, expected, groups):
     mapping = map_token_offsets(text, offsets, tokens)
     assert units_of(mapping) == expected
@@ -99,6 +117,27 @@ def test_accepted_offsets(text, offsets, tokens, expected, groups):
     ("ab", [(0, 2), (0, 2)], ["ab", "ab"], "unverified_overlap", 0),         # identical
     ("ab", [(0, 1), (0, 1), (0, 2)], [M, M, "ab"], "unverified_overlap", 0),  # two metaspaces
     ("ab", [(0, 1), (0, 1), (0, 1)], [M, "a", "b"], "unverified_overlap", 0),  # identical after a group
+    ("de\ufb01ne", [(0, 3), (2, 3)], [M + "def", "i"], "unverified_overlap", 2),            # nested, plausible pieces
+    ("de\ufb01ne", [(0, 3), (2, 3), (3, 5)], [M + "def", "i", "ne"], "unverified_overlap", 2),  # nested, then a normal token
+    ("de\ufb01ne", [(0, 3), (2, 3)], [M + "def", "xyz"], "unverified_overlap", 2),          # nested, unrelated pieces
+    ("\ufb01", [(0, 1), (0, 1)], [M + "f", "i"], "unverified_overlap", 0),                  # identical, pieces spell fi
+    ("de\ufb01", [(0, 2), (2, 3), (2, 3)], [M + "de", "f", "i"], "unverified_overlap", 2),  # identical mid-text
+    ("de\ufb01ne", [(0, 3), (2, 5)], [M + "dex", "ine"], "unverified_overlap", 2),          # unrelated first piece
+    ("de\ufb01ne", [(0, 3), (2, 5)], [M + "def", "xne"], "unverified_overlap", 2),          # unrelated second piece
+    ("de\ufb01ne", [(0, 3), (2, 5)], [M + "def", M + "ine"], "unverified_overlap", 2),      # marker on the continuation
+    ("de\ufb01ne", [(0, 4), (2, 5)], [M + "def", "ine"], "unverified_overlap", 2),          # two-character overlap
+    ("de\ufb01ne", [(0, 2), (2, 3), (2, 5)], [M + "de", "f", "ine"], "unverified_overlap", 2),  # previous token starts at s
+    ("de\ufb01ne", [(0, 4), (3, 5)], [M + "defi", "ne"], "unverified_overlap", 3),          # overlap on a non-ligature
+    ("de\ufb01ne", [(0, 3), (2, 3), (2, 5)], [M + "def", "i", "ne"], "unverified_overlap", 2),  # three tokens on one character
+    ("de\ufb01ne", [(0, 3), (2, 5), (3, 5)], [M + "def", "ine", "ne"], "unverified_overlap", 3),  # extra overlap after a merge
+    ("x\ufb01\ufb01ne", [(0, 2), (1, 3), (2, 5)], [M + "xf", "if", "ine"], "unverified_overlap", 2),  # chained: second ligature after a merge
+    ("define", [(0, 3), (2, 5)], [M + "def", "ine"], "unverified_overlap", 2),              # ASCII text, same shape
+    ("a\u2122b", [(0, 2), (1, 3)], [M + "aT", "Mb"], "unverified_overlap", 1),              # TM sign
+    ("de\ufb00ne", [(0, 3), (2, 5)], [M + "def", "fne"], "unverified_overlap", 2),          # unsupported U+FB00
+    ("de\ufb03ne", [(0, 3), (2, 5)], [M + "def", "fine"], "unverified_overlap", 2),         # unsupported U+FB03
+    ("de\ufb04ne", [(0, 3), (2, 5)], [M + "def", "flne"], "unverified_overlap", 2),        # unsupported U+FB04
+    ("de\ufb05ne", [(0, 3), (2, 5)], [M + "des", "tne"], "unverified_overlap", 2),         # unsupported U+FB05
+    ("de\ufb06ne", [(0, 3), (2, 5)], [M + "des", "tne"], "unverified_overlap", 2),         # unsupported U+FB06
     ("\u2026", [(0, 1), (0, 1), (0, 1)], [M, "..", "."], "unverified_overlap", 0),  # no compat rule
     (" a", [(0, 1), (0, 2)], [M, "a"], "unverified_overlap", 0),             # metaspace on whitespace
     ("abc", [(0, 1), (1, 2), (0, 3)], ["a", "b", M], "non_monotonic", 0),
@@ -113,7 +152,14 @@ def test_accepted_offsets(text, offsets, tokens, expected, groups):
     ("abc", [(0, 3)], ["a", "b"], "length_mismatch", None),
 ], ids=["zero-length-first", "zero-length-middle", "zero-length-last", "special-token",
         "non-monotonic", "non-monotonic-later", "nested", "partial", "identical",
-        "double-metaspace", "identical-after-group", "ellipsis-expansion", "metaspace-on-space-overlap",
+        "double-metaspace", "identical-after-group",
+        "ligature-nested", "ligature-nested-then-token", "ligature-nested-unrelated",
+        "ligature-identical-start", "ligature-identical-mid", "ligature-bad-first-piece",
+        "ligature-bad-second-piece", "ligature-continuation-marker", "ligature-two-char-overlap",
+        "ligature-previous-starts-at-s", "ligature-non-ligature-overlap", "ligature-three-tokens",
+        "ligature-extra-overlap", "ligature-chained-rejected", "ascii-same-shape", "trade-mark-overlap",
+        "unsupported-fb00", "unsupported-fb03", "unsupported-fb04", "unsupported-fb05", "unsupported-fb06",
+        "ellipsis-expansion", "metaspace-on-space-overlap",
         "trailing-metaspace-backwards", "past-end", "negative", "reversed", "bool", "float",
         "triple", "not-a-pair", "non-str-token", "length-mismatch"])
 def test_rejected_offsets(text, offsets, tokens, reason, position):
@@ -134,6 +180,19 @@ def test_inputs_must_be_sequences(offsets, tokens, reason):
 def test_text_must_be_a_str():
     assert reject(b"ab", [(0, 2)], ["ab"]).reason == "text_not_str"
 
+def test_supported_ligatures_match_their_nfkc_expansion():
+    assert set(token_offsets._LIGATURE_EXPANSION) == {"\ufb01", "\ufb02"}
+    for character, expansion in token_offsets._LIGATURE_EXPANSION.items():
+        assert unicodedata.normalize("NFKC", character) == expansion
+        assert len(expansion) == 2
+
+
+def test_ligature_continuation_needs_the_previous_token_to_end_the_unit():
+    # Not reachable through map_token_offsets (_group keeps previous_end == pairs[i - 1][1]);
+    # pinned here so the helper cannot silently drop that condition.
+    text, tokens = "de\ufb01ne", [M + "def", "ine"]
+    assert token_offsets._is_ligature_continuation(text, [(0, 3), (2, 5)], tokens, 1, 3) is True
+    assert token_offsets._is_ligature_continuation(text, [(0, 4), (2, 5)], tokens, 1, 3) is False
 
 def test_error_messages_never_contain_document_text():
     error = reject("SECRET-WORD", [(0, 6)], ["SECRET"])

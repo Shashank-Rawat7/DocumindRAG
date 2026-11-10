@@ -1,4 +1,4 @@
-"""Tokenizer content-token offsets -> weighted source units for the chunker (om-v1).
+"""Tokenizer content-token offsets -> weighted source units for the chunker (om-v2).
 
 Pure function, no model, no I/O. Input is the output of
 ``tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)``
@@ -9,13 +9,19 @@ The result is a sequence of non-overlapping half-open code-point spans of the
 ORIGINAL text, each carrying the number of model tokens it represents. Pass it
 to ``chunk_text(text, spans, config, token_counts=counts)``.
 
-om-v1 rules (anything else raises OffsetMappingError; nothing is guessed):
+om-v2 rules (anything else raises OffsetMappingError; nothing is guessed):
   * Every offset is a pair of Python ints with 0 <= start < end <= len(text).
     Zero-length offsets are rejected.
   * Token starts never decrease.
   * Verified Metaspace pattern: a token "\u2581" at (s, s+1), where text[s] is
     not whitespace, immediately followed by a non-"\u2581" token starting at s
     and ending at or after s+1, becomes one unit (s, end) with token_count 2.
+  * Verified ligature continuation: a token that starts at the last character
+    of the previous unit, where that character is U+FB01 or U+FB02, and ends
+    beyond that unit, extends the unit (token_count + 1) when the previous token
+    ends with the first letter of the character's NFKC expansion ("f") and this
+    token begins with the remaining letter ("i" or "l"). A ligature overlap
+    directly after such a continuation is rejected.
   * Every other token becomes its own unit with token_count 1 and must not
     overlap the previous unit.
   * Uncovered characters that are ignorable (text_boundaries.is_ignorable) are
@@ -40,11 +46,13 @@ from app.rag.text_boundaries import (
 )
 
 METASPACE = "\u2581"
-OFFSET_MAPPING_VERSION = "om-v1"
+OFFSET_MAPPING_VERSION = "om-v2"
 
+# The only compatibility ligatures whose split tokens may overlap (value: NFKC expansion).
+_LIGATURE_EXPANSION = {"\ufb01": "fi", "\ufb02": "fl"}
 
 class OffsetMappingError(ValueError):
-    """Offsets that om-v1 cannot map safely. ``reason`` is a fixed code; the
+    """Offsets that om-v2 cannot map safely. ``reason`` is a fixed code; the
     message never contains document text."""
 
     def __init__(self, reason: str, position: int | None = None):
@@ -76,7 +84,7 @@ def signature_fields() -> dict:
     """Identity of the mapping rules, for documents.indexed_signature (C2.5)."""
     return {
         "offset_mapping_version": OFFSET_MAPPING_VERSION,
-        "overlap_rule": "metaspace_prefix_same_start",
+        "overlap_rule": "metaspace_prefix_same_start+ligature_fb01_fb02_continuation",
         "zero_length_offsets": "reject",
         "grapheme_expansion": "same_cluster_extenders_only",
         "grapheme_segmentation": GRAPHEME_SEGMENTATION,
@@ -138,6 +146,7 @@ def _group(text, pairs, tokens) -> tuple[list[list[int]], int]:
     """Units as mutable [start, end, token_count, first_token]."""
     units: list[list[int]] = []
     metaspace_groups = 0
+    last_continuation = -1          # index of the token that last extended a unit over a ligature
     previous_end = 0
     i = 0
     while i < len(pairs):
@@ -150,7 +159,21 @@ def _group(text, pairs, tokens) -> tuple[list[list[int]], int]:
             i += 2
             continue
         if s < previous_end:
+            if (
+                i - 1 != last_continuation
+                and _is_ligature_continuation(
+                    text, pairs, tokens, i, previous_end
+                )
+            ):
+                units[-1][1] = e
+                units[-1][2] += 1
+                last_continuation = i
+                previous_end = e
+                i += 1
+                continue
+
             raise OffsetMappingError("unverified_overlap", s)
+
         units.append([s, e, 1, i])
         previous_end = e
         i += 1
@@ -166,6 +189,23 @@ def _is_metaspace_prefix(text, pairs, tokens, i, previous_end) -> bool:
     s2, e2 = pairs[i + 1]
     return s2 == s and e2 >= s + 1
 
+
+def _is_ligature_continuation(text, pairs, tokens, i, previous_end) -> bool:
+    """Token i overlaps the previous unit only because the tokenizer split a
+    compatibility ligature (U+FB01 or U+FB02) between two tokens."""
+    s, e = pairs[i]
+    expansion = _LIGATURE_EXPANSION.get(text[s])
+    if expansion is None or i == 0:
+        return False
+    previous_start, previous_token_end = pairs[i - 1]
+    return (
+        s == previous_end - 1                       # starts at the previous unit's last character
+        and e > previous_end                        # and extends beyond it: not nested, not identical
+        and previous_start < s                      # the previous token began earlier
+        and previous_token_end == previous_end      # and is the token that ends the unit
+        and tokens[i - 1].endswith(expansion[0])    # "...f" | "i..." (or "l...")
+        and tokens[i].startswith(expansion[1:])     # the remaining letter; no marker is stripped
+    )
 
 # ---------- step 3: grapheme expansion ----------
 
