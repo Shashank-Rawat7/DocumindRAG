@@ -26,6 +26,12 @@ representative of its own passage at smaller cutoffs then disappears from the co
 so a distinct metric at a small ``k`` depends on chunks beyond ``k``. Chunks after rank 20 are
 never inspected, so a bridge at rank 21 changes nothing.
 
+``is_truncated(ranking, k)`` is True when the compressed ranking has fewer than ``k``
+representatives (``len(representatives(ranking)) < k``, counted from the first 20 chunks only), so
+a k-dependent distinct metric (``distinct_hit_at_k``, ``distinct_unit_recall_at_k``,
+``distinct_evidence_coverage_at_k``) at that ``k`` used every representative there was. Exactly
+``k`` representatives is not truncated. The distinct reciprocal rank does not depend on ``k``.
+
 Errors (as in ``metrics``): ``TypeError`` for a ranking that is not a list or tuple or an item
 that is not a ``RankedChunk`` among the first 20; ``ValueError`` for an ``original_rank`` outside
 ``1..MAX_RANK`` (representatives come only from the first ``MAX_RANK`` chunks). Messages are fixed text. Nothing is modified.
@@ -36,7 +42,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.rag.evaluation.intervals import collides
-from app.rag.evaluation.metrics import MAX_RANK, RankedChunk, _top
+from app.rag.evaluation.metrics import MAX_RANK, RankedChunk, _check_k, _top
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,3 +82,9 @@ def representatives(ranking: Sequence[RankedChunk]) -> tuple[Representative, ...
         best_ranks.append(best)
 
     return tuple(Representative(rank, chunks[rank - 1]) for rank in sorted(best_ranks))
+
+
+def is_truncated(ranking: Sequence[RankedChunk], k: int) -> bool:
+    """True when the first ``MAX_RANK`` chunks give fewer than ``k`` representatives."""
+    _check_k(k)
+    return len(representatives(ranking)) < k

@@ -15,15 +15,22 @@ L  error messages never contain input content
 M  import isolation
 N  distinct-passage metrics (distinct_hit_at_k, distinct_reciprocal_rank; the grouping itself is
    tested in test_evaluation_passages.py)
+O  E1.3.3: distinct_unit_recall_at_k and distinct_evidence_coverage_at_k (hand-computed values,
+   rules, alternatives, interval unions, truncation, bridges, validation, a seeded independent
+   cross-check, imports)
 """
 import dataclasses
+import inspect
+import random
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
 from app.rag.evaluation import metrics as mt
+from app.rag.evaluation import passages as ps
 from app.rag.evaluation import schema as s
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -943,3 +950,409 @@ def test_the_raw_metrics_are_unchanged_by_the_distinct_ones():
     mt.distinct_hit_at_k(q, ranking, 2)
     mt.distinct_reciprocal_rank(q, ranking)
     assert [mt.hit_at_k(q, ranking, k) for k in mt.CUTOFFS] + [mt.reciprocal_rank(q, ranking)] == before
+
+
+# ---------- O. distinct Unit Recall@k and Distinct Coverage@k ----------
+
+# Gold: WORKED (u1 doc-a [0,100); u2 doc-a [200,300) or doc-b [0,50); u3 doc-b [1000,1100)).
+# Rank 2 overlaps rank 1, so it is a non-representative member of rank 1's passage.
+#   1 doc-a [0,60)     2 doc-a [30,100)    3 doc-a [250,300)    4 doc-b [0,30)    5 doc-b [1000,1060)
+# Representatives are ranks 1, 3, 4, 5 (compressed positions 1, 2, 3, 4).
+DEDUP_RANKING = [
+    chunk("doc-a", 0, 60), chunk("doc-a", 30, 100), chunk("doc-a", 250, 300),
+    chunk("doc-b", 0, 30), chunk("doc-b", 1000, 1060),
+]
+
+
+def exact(value):
+    return float(value)
+
+
+def test_distinct_unit_recall_is_hand_computed_at_every_cutoff():
+    # k=1: u1 (60%).  k=2: + u2 via [250,300) (50%).  k=3: [0,30) adds nothing new.  k=4: + u3 (60%).
+    assert [mt.distinct_unit_recall_at_k(WORKED, DEDUP_RANKING, k) for k in (1, 2, 3, 4, 5, 20)] == [
+        exact(Fraction(1, 3)), exact(Fraction(2, 3)), exact(Fraction(2, 3)), 1.0, 1.0, 1.0,
+    ]
+
+
+def test_distinct_coverage_is_hand_computed_at_every_cutoff():
+    # Coverage of u1 stays 3/5 (rank 2 is discarded); u2 gets 1/2 at k=2 and 3/5 (doc-b) at k=3.
+    assert [mt.distinct_evidence_coverage_at_k(WORKED, DEDUP_RANKING, k) for k in (1, 2, 3, 4, 5, 20)] == [
+        exact(Fraction(1, 5)), exact(Fraction(11, 30)), exact(Fraction(2, 5)),
+        exact(Fraction(3, 5)), exact(Fraction(3, 5)), exact(Fraction(3, 5)),
+    ]
+
+
+def test_distinct_recall_and_coverage_differ_from_the_raw_ones_as_deduplication_dictates():
+    raw_recall = [mt.unit_recall_at_k(WORKED, DEDUP_RANKING, k) for k in (1, 2, 3)]
+    raw_cov = [mt.evidence_coverage_at_k(WORKED, DEDUP_RANKING, k) for k in (1, 2, 3)]
+    assert raw_recall == [exact(Fraction(1, 3)), exact(Fraction(1, 3)), exact(Fraction(2, 3))]
+    assert raw_cov == [exact(Fraction(1, 5)), exact(Fraction(1, 3)), exact(Fraction(1, 2))]
+    # Distinct recall is higher at k=2 (the next passage moved up) ...
+    assert mt.distinct_unit_recall_at_k(WORKED, DEDUP_RANKING, 2) > raw_recall[1]
+    # ... distinct coverage is higher at k=2 for the same reason, but lower at k=3: the discarded
+    # rank-2 chunk no longer contributes the rest of u1's span.
+    assert mt.distinct_evidence_coverage_at_k(WORKED, DEDUP_RANKING, 2) > raw_cov[1]
+    assert mt.distinct_evidence_coverage_at_k(WORKED, DEDUP_RANKING, 3) < raw_cov[2]
+
+
+@pytest.mark.parametrize(
+    "rule, expected",
+    [
+        pytest.param(mt.ANY_OVERLAP, Fraction(1), id="any-overlap"),
+        pytest.param(mt.HALF_COVERAGE, Fraction(2, 3), id="half-coverage"),
+        pytest.param(mt.FULL_COVERAGE, Fraction(1, 3), id="full-coverage"),
+    ],
+)
+def test_distinct_unit_recall_under_each_relevance_rule(rule, expected):
+    # u1 [0,100) is covered fully, u2 [200,300) by exactly 50%, u3 [400,500) by 10%.
+    q = question(unit("u1", span("doc-a", 0, 100)), unit("u2", span("doc-a", 200, 300)),
+                 unit("u3", span("doc-a", 400, 500)))
+    ranking = [chunk("doc-a", 0, 100), chunk("doc-a", 0, 100), chunk("doc-a", 200, 250), chunk("doc-a", 490, 500)]
+    assert mt.distinct_unit_recall_at_k(q, ranking, 3, rule) == exact(expected)  # the duplicate is discarded
+    assert mt.distinct_unit_recall_at_k(q, ranking, 3) == mt.distinct_unit_recall_at_k(q, ranking, 3, mt.HALF_COVERAGE)
+    # the raw metric needs k=4 for the same units: the duplicate used a place
+    assert mt.unit_recall_at_k(q, ranking, 3, mt.ANY_OVERLAP) == exact(Fraction(2, 3))
+
+
+def test_distinct_coverage_does_not_depend_on_any_relevance_rule():
+    assert list(inspect.signature(mt.distinct_evidence_coverage_at_k).parameters) == [
+        "question", "ranking", "k"]
+    with pytest.raises(TypeError):
+        mt.distinct_evidence_coverage_at_k(WORKED, DEDUP_RANKING, 3, mt.FULL_COVERAGE)
+    # a chunk that no rule would call relevant (10% of the span) still counts toward coverage
+    q = single(0, 100)
+    assert mt.distinct_evidence_coverage_at_k(q, [chunk("doc-a", 0, 10)], 1) == exact(Fraction(1, 10))
+    assert mt.distinct_unit_recall_at_k(q, [chunk("doc-a", 0, 10)], 1) == 0.0
+
+
+def test_distinct_coverage_takes_the_union_of_separate_representatives_and_ignores_discarded_chunks():
+    q = single(0, 100)
+    # ranks 1 and 2 are separate passages (gap); rank 3 overlaps rank 1 and is discarded.
+    ranking = [chunk("doc-a", 0, 30), chunk("doc-a", 60, 90), chunk("doc-a", 20, 50)]
+    assert [r.original_rank for r in ps.representatives(ranking)] == [1, 2]
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 3) == exact(Fraction(3, 5))
+    assert mt.evidence_coverage_at_k(q, ranking, 3) == exact(Fraction(4, 5))  # raw counts the discarded chunk
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 1) == exact(Fraction(3, 10))
+
+
+def test_distinct_unit_recall_and_coverage_with_alternatives_and_independent_units():
+    q = question(unit("u1", span("doc-a", 0, 10), span("doc-b", 0, 10)), unit("u2", span("doc-a", 100, 110)))
+    ranking = [chunk("doc-b", 0, 10), chunk("doc-b", 5, 12), chunk("doc-a", 100, 105)]
+    # rank 2 is merged into rank 1; u1 is satisfied by its second alternative, u2 by 50%.
+    assert mt.distinct_unit_recall_at_k(q, ranking, 1) == 0.5
+    assert mt.distinct_unit_recall_at_k(q, ranking, 2) == 1.0
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 1) == 0.5
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 2) == exact(Fraction(3, 4))
+
+
+def test_a_chunk_covering_two_units_counts_for_both():
+    q = question(unit("u1", span("doc-a", 0, 10)), unit("u2", span("doc-a", 20, 30)))
+    ranking = [chunk("doc-a", 0, 30)]
+    assert mt.distinct_unit_recall_at_k(q, ranking, 1) == 1.0
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 1) == 1.0
+
+
+def test_a_relevant_later_member_gets_no_credit_for_recall_or_coverage_when_the_representative_is_not_relevant():
+    q = single(1000, 1100)
+    ranking = [chunk("doc-a", 900, 1010), chunk("doc-a", 1000, 1100)]  # rank 1 covers 10%; rank 2 is discarded
+    assert mt.distinct_unit_recall_at_k(q, ranking, 2) == 0.0
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 2) == exact(Fraction(1, 10))
+    assert mt.unit_recall_at_k(q, ranking, 2) == 1.0
+
+
+def test_truncated_rankings_use_every_representative_and_k_beyond_p_changes_nothing():
+    q = WORKED
+    ranking = DEDUP_RANKING  # P = 4
+    for k in (4, 5, 12, 20):
+        assert mt.distinct_unit_recall_at_k(q, ranking, k) == mt.distinct_unit_recall_at_k(q, ranking, 4)
+        assert mt.distinct_evidence_coverage_at_k(q, ranking, k) == mt.distinct_evidence_coverage_at_k(q, ranking, 4)
+    assert [ps.is_truncated(ranking, k) for k in (3, 4, 5, 20)] == [False, False, True, True]
+
+
+@pytest.mark.parametrize("ranking", [pytest.param([], id="list"), pytest.param((), id="tuple")])
+def test_distinct_recall_and_coverage_of_an_empty_ranking_are_zero(ranking):
+    for k in (1, 5, 20):
+        assert mt.distinct_unit_recall_at_k(WORKED, ranking, k) == 0.0
+        assert mt.distinct_evidence_coverage_at_k(WORKED, ranking, k) == 0.0
+
+
+def test_a_tuple_ranking_gives_the_same_values_as_a_list():
+    assert mt.distinct_unit_recall_at_k(WORKED, tuple(DEDUP_RANKING), 3) == mt.distinct_unit_recall_at_k(
+        WORKED, DEDUP_RANKING, 3)
+    assert mt.distinct_evidence_coverage_at_k(WORKED, tuple(DEDUP_RANKING), 3) == mt.distinct_evidence_coverage_at_k(
+        WORKED, DEDUP_RANKING, 3)
+
+
+def test_a_bridge_at_rank_20_changes_distinct_recall_and_coverage_at_small_k():
+    q = single(20, 30)
+    ranking = bridge_ranking(20)
+    assert mt.unit_recall_at_k(q, ranking, 2) == 1.0 and mt.evidence_coverage_at_k(q, ranking, 2) == 1.0  # raw
+    assert [mt.distinct_unit_recall_at_k(q, ranking, k) for k in (1, 2, 5, 20)] == [0.0, 0.0, 0.0, 0.0]
+    assert [mt.distinct_evidence_coverage_at_k(q, ranking, k) for k in (1, 2, 5, 20)] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_the_same_chunk_at_rank_21_changes_nothing_for_distinct_recall_and_coverage():
+    q = single(20, 30)
+    ranking = bridge_ranking(21)
+    assert [mt.distinct_unit_recall_at_k(q, ranking, k) for k in (1, 2, 5, 20)] == [0.0, 1.0, 1.0, 1.0]
+    assert [mt.distinct_evidence_coverage_at_k(q, ranking, k) for k in (1, 2, 5, 20)] == [0.0, 1.0, 1.0, 1.0]
+
+
+def test_distinct_recall_and_coverage_use_only_the_first_20_chunks_of_a_longer_ranking():
+    q = single(1000, 1100)
+    ranking = fillers(1, 20) + [chunk("doc-a", 1000, 1100)]
+    assert mt.distinct_unit_recall_at_k(q, ranking, 20) == 0.0
+    assert mt.distinct_evidence_coverage_at_k(q, ranking, 20) == 0.0
+    collapsed = [chunk("doc-a", 0, 10)] * 20 + [chunk("doc-a", 1000, 1100)]  # one representative
+    assert mt.distinct_unit_recall_at_k(q, collapsed, 20) == 0.0
+    assert ps.is_truncated(collapsed, 2) and not ps.is_truncated(collapsed, 1)
+
+
+def test_distinct_recall_and_coverage_never_decrease_as_k_grows():
+    rng = random.Random(7)
+    for _ in range(300):
+        q = random_question(rng)
+        ranking = random_ranking(rng)
+        recall = [mt.distinct_unit_recall_at_k(q, ranking, k) for k in range(1, 21)]
+        coverage = [mt.distinct_evidence_coverage_at_k(q, ranking, k) for k in range(1, 21)]
+        assert recall == sorted(recall) and coverage == sorted(coverage)
+
+
+def test_results_at_a_truncated_k_equal_the_results_using_every_representative():
+    rng = random.Random(11)
+    seen = 0
+    for _ in range(300):
+        q = random_question(rng)
+        ranking = random_ranking(rng)
+        for k in range(1, 21):
+            if ps.is_truncated(ranking, k):
+                seen += 1
+                for rule in mt.RELEVANCE_RULES:
+                    assert mt.distinct_hit_at_k(q, ranking, k, rule) == mt.distinct_hit_at_k(q, ranking, 20, rule)
+                    assert mt.distinct_unit_recall_at_k(q, ranking, k, rule) == mt.distinct_unit_recall_at_k(
+                        q, ranking, 20, rule)
+                assert mt.distinct_evidence_coverage_at_k(q, ranking, k) == mt.distinct_evidence_coverage_at_k(
+                    q, ranking, 20)
+    assert seen > 1000
+
+
+def test_distinct_recall_and_coverage_have_exact_types():
+    q = single(1000, 1100)
+    for value in (
+        mt.distinct_unit_recall_at_k(q, redundant_then_relevant(), 2),
+        mt.distinct_evidence_coverage_at_k(q, redundant_then_relevant(), 2),
+        mt.distinct_unit_recall_at_k(q, [], 2),
+        mt.distinct_evidence_coverage_at_k(q, [], 2),
+    ):
+        assert type(value) is float
+
+
+@pytest.mark.parametrize("k", [True, False, 1.0, "5", None])
+def test_distinct_recall_and_coverage_k_of_the_wrong_type_is_a_type_error(k):
+    with pytest.raises(TypeError):
+        mt.distinct_unit_recall_at_k(WORKED, WORKED_RANKING, k)
+    with pytest.raises(TypeError):
+        mt.distinct_evidence_coverage_at_k(WORKED, WORKED_RANKING, k)
+
+
+@pytest.mark.parametrize("k", [0, -1, 21])
+def test_distinct_recall_and_coverage_k_outside_1_to_20_is_a_value_error(k):
+    with pytest.raises(ValueError):
+        mt.distinct_unit_recall_at_k(WORKED, WORKED_RANKING, k)
+    with pytest.raises(ValueError):
+        mt.distinct_evidence_coverage_at_k(WORKED, WORKED_RANKING, k)
+
+
+@pytest.mark.parametrize("ranking", [None, "abc", "", {}, set(), 5, (c for c in [])])
+def test_a_distinct_recall_and_coverage_ranking_must_be_a_list_or_tuple(ranking):
+    with pytest.raises(TypeError):
+        mt.distinct_unit_recall_at_k(WORKED, ranking, 5)
+    with pytest.raises(TypeError):
+        mt.distinct_evidence_coverage_at_k(WORKED, ranking, 5)
+
+
+def test_distinct_recall_and_coverage_check_chunks_among_the_first_20_only():
+    for function in (mt.distinct_unit_recall_at_k, mt.distinct_evidence_coverage_at_k):
+        with pytest.raises(TypeError):
+            function(WORKED, [chunk("doc-a", 0, 5), None], 5)
+        with pytest.raises(TypeError):
+            function(WORKED, fillers(1, 19) + ["x"], 5)
+        assert function(WORKED, fillers(1, 20) + ["x"], 20) == 0.0
+
+
+def test_distinct_recall_and_coverage_validate_the_question_and_the_rule():
+    unanswerable = question(answerable=False, units=(), expected_answer=None, source_language=None,
+                            difficulty=None, close_distractor=None)
+    for function in (mt.distinct_unit_recall_at_k, mt.distinct_evidence_coverage_at_k):
+        with pytest.raises(ValueError):
+            function(unanswerable, WORKED_RANKING, 5)
+        with pytest.raises(TypeError):
+            function("q", WORKED_RANKING, 5)
+        bad = dataclasses.replace(WORKED, units=(unit("u1", s.Span("doc-a", SHA, True, 5, "x", SHA)),))
+        with pytest.raises(TypeError):
+            function(bad, [], 5)
+        no_units = dataclasses.replace(WORKED, units=())
+        with pytest.raises(ValueError):
+            function(no_units, [], 5)
+    with pytest.raises(ValueError):
+        mt.distinct_unit_recall_at_k(WORKED, WORKED_RANKING, 5, "half")
+    with pytest.raises(TypeError):
+        mt.distinct_unit_recall_at_k(WORKED, WORKED_RANKING, 5, None)
+
+
+def test_distinct_recall_and_coverage_validation_order_matches_distinct_hit():
+    # rule, then question, then k, then ranking (coverage has no rule).
+    with pytest.raises(ValueError):
+        mt.distinct_unit_recall_at_k("q", None, "x", "bad-rule")
+    with pytest.raises(TypeError):
+        mt.distinct_unit_recall_at_k("q", None, 0, mt.HALF_COVERAGE)
+    for function in (mt.distinct_unit_recall_at_k, mt.distinct_evidence_coverage_at_k):
+        with pytest.raises(TypeError):
+            function("q", None, 0)
+        with pytest.raises(ValueError):
+            function(WORKED, None, 0)
+        with pytest.raises(TypeError):
+            function(WORKED, None, 5)
+
+
+def test_distinct_recall_and_coverage_do_not_modify_their_inputs_and_are_deterministic():
+    q = WORKED
+    ranking = list(DEDUP_RANKING)
+    snapshot = list(ranking)
+    first = (mt.distinct_unit_recall_at_k(q, ranking, 3), mt.distinct_evidence_coverage_at_k(q, ranking, 3))
+    assert (mt.distinct_unit_recall_at_k(q, ranking, 3), mt.distinct_evidence_coverage_at_k(q, ranking, 3)) == first
+    assert ranking == snapshot and all(a is b for a, b in zip(ranking, snapshot))
+    assert q == WORKED
+
+
+def test_distinct_recall_and_coverage_error_messages_never_contain_input_content():
+    calls = []
+    for function in (mt.distinct_unit_recall_at_k, mt.distinct_evidence_coverage_at_k):
+        calls += [
+            lambda f=function: f(WORKED, [CANARY], 5),
+            lambda f=function: f(WORKED, CANARY, 5),
+            lambda f=function: f(CANARY, WORKED_RANKING, 5),
+            lambda f=function: f(WORKED, WORKED_RANKING, CANARY),
+        ]
+    calls.append(lambda: mt.distinct_unit_recall_at_k(WORKED, WORKED_RANKING, 5, CANARY))
+    for call in calls:
+        with pytest.raises((TypeError, ValueError)) as caught:
+            call()
+        assert CANARY not in str(caught.value)
+
+
+def test_the_existing_metrics_are_unchanged_by_the_new_ones():
+    q = WORKED
+    before = [mt.hit_at_k(q, DEDUP_RANKING, 3), mt.unit_recall_at_k(q, DEDUP_RANKING, 3),
+              mt.evidence_coverage_at_k(q, DEDUP_RANKING, 3), mt.distinct_hit_at_k(q, DEDUP_RANKING, 3),
+              mt.distinct_reciprocal_rank(q, DEDUP_RANKING)]
+    mt.distinct_unit_recall_at_k(q, DEDUP_RANKING, 3)
+    mt.distinct_evidence_coverage_at_k(q, DEDUP_RANKING, 3)
+    assert before == [mt.hit_at_k(q, DEDUP_RANKING, 3), mt.unit_recall_at_k(q, DEDUP_RANKING, 3),
+                      mt.evidence_coverage_at_k(q, DEDUP_RANKING, 3), mt.distinct_hit_at_k(q, DEDUP_RANKING, 3),
+                      mt.distinct_reciprocal_rank(q, DEDUP_RANKING)]
+
+
+# An independent reference: union-find passages, and positions as Python sets (no interval arithmetic).
+
+def reference_representatives(ranking):
+    chunks = ranking[:20]
+    parent = list(range(len(chunks)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(chunks)):
+        for j in range(i + 1, len(chunks)):
+            a, b = chunks[i], chunks[j]
+            if a.corpus_key == b.corpus_key and a.start <= b.end and b.start <= a.end:  # overlap or touch
+                parent[find(i)] = find(j)
+    best = {}
+    for index in range(len(chunks)):
+        root = find(index)
+        best[root] = min(best.get(root, index), index)
+    return [chunks[index] for index in sorted(best.values())]
+
+
+def positions(item):
+    return {(item.corpus_key, p) for p in range(item.start, item.end)}
+
+
+def reference_relevant(c, sp, rule):
+    overlap = len(positions(c) & positions(sp))
+    length = sp.end - sp.start
+    return {mt.ANY_OVERLAP: overlap > 0, mt.HALF_COVERAGE: 2 * overlap >= length, mt.FULL_COVERAGE: overlap == length}[rule]
+
+
+def reference_recall(q, ranking, k, rule):
+    chunks = reference_representatives(ranking)[:k]
+    satisfied = sum(any(reference_relevant(c, sp, rule) for sp in u.spans for c in chunks) for u in q.units)
+    return Fraction(satisfied, len(q.units))
+
+
+def reference_coverage(q, ranking, k):
+    chunks = reference_representatives(ranking)[:k]
+    covered = set().union(*[positions(c) for c in chunks]) if chunks else set()
+    total = Fraction(0)
+    for u in q.units:
+        total += max(Fraction(len(positions(sp) & covered), sp.end - sp.start) for sp in u.spans)
+    return total / len(q.units)
+
+
+def random_question(rng):
+    units = []
+    for number in range(rng.randint(1, 3)):
+        spans = []
+        for _ in range(rng.randint(1, 2)):
+            start = rng.randint(0, 50)
+            spans.append(span(rng.choice(["doc-a", "doc-b"]), start, start + rng.randint(1, 25)))
+        units.append(unit(f"u{number}", *spans))
+    return question(*units)
+
+
+def random_ranking(rng):
+    ranking = []
+    for _ in range(rng.randint(0, 26)):
+        start = rng.randint(0, 60)
+        ranking.append(chunk(rng.choice(["doc-a", "doc-b", "doc-c"]), start, start + rng.randint(1, 12)))
+    return ranking
+
+
+def test_distinct_recall_and_coverage_match_an_independent_reference_on_random_inputs():
+    rng = random.Random(20261113)
+    merged = positive = 0
+    for _ in range(600):
+        q = random_question(rng)
+        ranking = random_ranking(rng)
+        merged += len(reference_representatives(ranking)) < len(ranking[:20])
+        for k in (1, 2, 3, 5, 10, 20):
+            for rule in mt.RELEVANCE_RULES:
+                expected = reference_recall(q, ranking, k, rule)
+                assert mt.distinct_unit_recall_at_k(q, ranking, k, rule) == float(expected)
+                positive += expected > 0
+            assert mt.distinct_evidence_coverage_at_k(q, ranking, k) == float(reference_coverage(q, ranking, k))
+            assert ps.is_truncated(ranking, k) == (len(reference_representatives(ranking)) < k)
+    assert merged > 150 and positive > 500  # the generator exercises merging and non-trivial values
+
+
+def test_the_new_functions_load_passages_lazily_and_no_heavy_dependencies():
+    code = (
+        "import sys\n"
+        "import app.rag.evaluation.metrics as m\n"
+        "assert 'app.rag.evaluation.passages' not in sys.modules\n"
+        "from app.rag.evaluation import schema as s\n"
+        "q = s.Question(question_id='q', split='dev', answerable=True, question='?', query_language='en',\n"
+        "    author_type='human', hindi_reviewed=False, expected_answer='a',\n"
+        "    units=(s.EvidenceUnit('u', (s.Span('d', 'a'*64, 0, 5, 'xxxxx', 'a'*64),)),),\n"
+        "    source_language='en', difficulty='direct', close_distractor=False)\n"
+        "assert m.distinct_unit_recall_at_k(q, [], 3) == 0.0\n"
+        "assert m.distinct_evidence_coverage_at_k(q, [], 3) == 0.0\n"
+        "heavy = ('sqlalchemy', 'torch', 'transformers', 'fastapi', 'sentence_transformers', 'numpy', 'pypdf')\n"
+        "print(sorted(x for x in sys.modules if x.split('.')[0] in heavy))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=PROJECT_ROOT, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "[]"

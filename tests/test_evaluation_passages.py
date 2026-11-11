@@ -8,6 +8,7 @@ E  invalid input
 F  purity and fixed messages
 G  seeded randomized comparison with an independent brute-force implementation
 H  imports: no cycle in either order, no heavy dependencies
+I  E1.3.3: is_truncated (P < k, P == k, P > k, empty, longer than 20, bridges, validation, purity)
 """
 import dataclasses
 import random
@@ -369,3 +370,143 @@ def test_importing_metrics_alone_does_not_load_passages():
     code = "import sys, app.rag.evaluation.metrics\nprint('app.rag.evaluation.passages' in sys.modules)\n"
     result = subprocess.run([sys.executable, "-c", code], cwd=PROJECT_ROOT, capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "False"
+
+
+# ---------- I. is_truncated ----------
+
+def test_is_truncated_is_true_exactly_when_there_are_fewer_than_k_representatives():
+    ranking = fillers(1, 5)  # P = 5
+    assert [ps.is_truncated(ranking, k) for k in (1, 3, 4, 5, 6, 10, 20)] == [
+        False, False, False, False, True, True, True]
+
+
+@pytest.mark.parametrize(
+    "ranking, p",
+    [
+        pytest.param([c("doc-a", 0, 10)] * 5, 1, id="duplicates-collapse-to-one"),
+        pytest.param([c("doc-a", 0, 10), c("doc-a", 10, 20), c("doc-a", 20, 30)], 1, id="touching-chain"),
+        pytest.param([c("doc-a", 0, 10), c("doc-a", 11, 20), c("doc-b", 0, 10)], 3, id="gap-and-documents"),
+        pytest.param(fillers(1, 20), 20, id="twenty-separate"),
+    ],
+)
+def test_is_truncated_compares_the_representative_count_with_k(ranking, p):
+    assert len(ps.representatives(ranking)) == p
+    for k in range(1, 21):
+        assert ps.is_truncated(ranking, k) is (p < k)
+
+
+def test_p_less_than_p_equal_to_and_p_greater_than_k():
+    ranking = [c("doc-a", 0, 10), c("doc-a", 5, 15), c("doc-b", 0, 10), c("doc-c", 0, 10)]  # P = 3
+    assert ps.is_truncated(ranking, 4) is True    # P < k
+    assert ps.is_truncated(ranking, 3) is False   # P == k
+    assert ps.is_truncated(ranking, 2) is False   # P > k
+
+
+def test_an_empty_ranking_is_truncated_at_every_k():
+    for ranking in ([], ()):
+        assert all(ps.is_truncated(ranking, k) is True for k in range(1, 21))
+
+
+def test_a_ranking_longer_than_20_counts_representatives_of_the_first_20_chunks_only():
+    assert ps.is_truncated(fillers(1, 60), 20) is False
+    collapsed = [c("doc-a", 0, 10)] * 20 + fillers(21, 40)  # one passage; the rest are never looked at
+    assert ps.is_truncated(collapsed, 1) is False and ps.is_truncated(collapsed, 2) is True
+    assert ps.is_truncated([c("doc-a", 0, 10)] * 19 + fillers(20, 25), 2) is False  # chunk 20 is a second passage
+
+
+def test_a_bridge_at_rank_20_makes_a_full_length_ranking_truncated_and_rank_21_does_not():
+    at_20 = bridge_ranking(20)
+    at_21 = bridge_ranking(21)
+    assert len(at_20) == 20 and len(ps.representatives(at_20)) == 18
+    assert [ps.is_truncated(at_20, k) for k in (18, 19, 20)] == [False, True, True]
+    assert len(ps.representatives(at_21)) == 20
+    assert ps.is_truncated(at_21, 20) is False
+
+
+def test_the_flag_is_consistent_with_the_number_of_representatives_on_random_rankings():
+    rng = random.Random(424242)
+    truncated = full = 0
+    for _ in range(800):
+        ranking = random_ranking(rng)
+        p = len(brute_force_ranks(ranking))
+        for k in (1, 3, 5, 10, 20):
+            result = ps.is_truncated(ranking, k)
+            assert result is (p < k)
+            truncated += result
+            full += not result
+    assert truncated > 500 and full > 500
+
+
+def test_is_truncated_returns_a_plain_bool():
+    assert type(ps.is_truncated([], 1)) is bool
+    assert type(ps.is_truncated(fillers(1, 3), 3)) is bool
+
+
+@pytest.mark.parametrize("k", [True, False, 1.0, "5", None, b"5"])
+def test_is_truncated_k_of_the_wrong_type_is_a_type_error(k):
+    with pytest.raises(TypeError):
+        ps.is_truncated(fillers(1, 3), k)
+
+
+@pytest.mark.parametrize("k", [0, -1, 21, 100])
+def test_is_truncated_k_outside_1_to_20_is_a_value_error(k):
+    with pytest.raises(ValueError):
+        ps.is_truncated(fillers(1, 3), k)
+
+
+@pytest.mark.parametrize("ranking", [None, "", "abc", b"", {}, set(), 5, iter(()), (x for x in ()), range(0)])
+def test_is_truncated_ranking_must_be_a_list_or_tuple(ranking):
+    with pytest.raises(TypeError):
+        ps.is_truncated(ranking, 5)
+
+
+def test_is_truncated_checks_chunks_among_the_first_20_only_and_k_before_the_ranking():
+    with pytest.raises(TypeError):
+        ps.is_truncated([c("doc-a", 0, 5), None], 5)
+    with pytest.raises(TypeError):
+        ps.is_truncated(fillers(1, 19) + ["x"], 5)
+    assert ps.is_truncated(fillers(1, 20) + ["x"], 20) is False
+    with pytest.raises(ValueError):
+        ps.is_truncated(None, 0)   # k is checked first, as in the distinct metrics
+    with pytest.raises(TypeError):
+        ps.is_truncated(None, "5")
+    with pytest.raises(TypeError):
+        ps.is_truncated(None, 5)
+
+
+def test_is_truncated_does_not_modify_its_input_and_is_deterministic():
+    ranking = [c("doc-b", 50, 60), c("doc-a", 0, 10), c("doc-b", 55, 70)]
+    snapshot = list(ranking)
+    first = [ps.is_truncated(ranking, k) for k in (1, 2, 3)]
+    assert [ps.is_truncated(ranking, k) for k in (1, 2, 3)] == first == [False, False, True]
+    assert ranking == snapshot and all(a is b for a, b in zip(ranking, snapshot))
+    assert [ps.is_truncated(tuple(ranking), k) for k in (1, 2, 3)] == first
+
+
+def test_is_truncated_error_messages_never_contain_input_content():
+    calls = [
+        lambda: ps.is_truncated(CANARY, 5),
+        lambda: ps.is_truncated([CANARY], 5),
+        lambda: ps.is_truncated([], CANARY),
+        lambda: ps.is_truncated([c(CANARY, 0, 5), CANARY], 5),
+    ]
+    for call in calls:
+        with pytest.raises((TypeError, ValueError)) as caught:
+            call()
+        assert CANARY not in str(caught.value)
+
+
+@pytest.mark.parametrize("first", ["passages", "metrics"])
+def test_is_truncated_imports_in_either_order_without_heavy_dependencies(first):
+    second = "metrics" if first == "passages" else "passages"
+    code = (
+        "import sys\n"
+        f"import app.rag.evaluation.{first}\n"
+        f"import app.rag.evaluation.{second}\n"
+        "from app.rag.evaluation import passages\n"
+        "assert passages.is_truncated([], 1) is True\n"
+        "heavy = ('sqlalchemy', 'torch', 'transformers', 'fastapi', 'sentence_transformers', 'numpy', 'pypdf')\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=PROJECT_ROOT, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "[]"

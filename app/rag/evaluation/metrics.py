@@ -26,13 +26,17 @@ Metrics, all over the first ``k`` chunks (``k`` is 1 to ``MAX_RANK``; the usual 
     unit, looking only at the first ``MAX_RANK`` chunks; 0 if there is none. (MRR is the mean
     of this over questions, computed in a later checkpoint.)
 
-Distinct-passage metrics (``distinct_hit_at_k``, ``distinct_reciprocal_rank``) apply the same
+Distinct-passage metrics (``distinct_hit_at_k``, ``distinct_unit_recall_at_k``,
+``distinct_evidence_coverage_at_k``, ``distinct_reciprocal_rank``) apply the same
 definitions to the representatives of ``passages.representatives`` instead of to the raw chunks:
 the ranking is collapsed to one chunk per passage (see that module for the rules, including the
 consequence of building passages from all 20 chunks), and ``k`` and the reciprocal rank count
 positions in that compressed ranking, not original ranks. Relevance is judged on the
 representative chunk alone. These are separate from the raw metrics, which stay primary. Because
 the compressed ranking can move a relevant passage up, a distinct Hit@k can exceed the raw Hit@k.
+When the compressed ranking has fewer than ``k`` representatives the k-dependent distinct metrics
+use all of them; ``passages.is_truncated`` reports that case (the metrics themselves return only
+their value).
 
 Fractions are computed exactly and converted to ``float`` once at the end.
 
@@ -290,3 +294,38 @@ def distinct_reciprocal_rank(question: Question, ranking: Sequence[RankedChunk],
         if any(_relevant(item.chunk, span, rule) for span in spans):
             return float(Fraction(1, position))
     return 0.0
+
+
+def distinct_unit_recall_at_k(
+    question: Question, ranking: Sequence[RankedChunk], k: int, rule: str = DEFAULT_RULE
+) -> float:
+    """The share of required units satisfied by the first ``k`` representatives.
+
+    ``k`` counts positions in the compressed representative ranking. If there are fewer than ``k``
+    representatives, all of them are used (``passages.is_truncated`` reports that).
+    """
+    from app.rag.evaluation.passages import representatives
+
+    _check_rule(rule)
+    units = _units(question)
+    _check_k(k)
+    chunks = [item.chunk for item in representatives(ranking)[:k]]
+    return float(Fraction(sum(_unit_satisfied(unit, chunks, rule) for unit in units), len(units)))
+
+
+def distinct_evidence_coverage_at_k(question: Question, ranking: Sequence[RankedChunk], k: int) -> float:
+    """The mean over units of the best span coverage by the first ``k`` representatives.
+
+    Only representatives are used: the non-representative chunks of a passage are discarded and
+    contribute no coverage, even where they reach text the representative does not. The result can
+    therefore be lower than ``evidence_coverage_at_k``, or higher when deduplication brings a
+    covering chunk inside the first ``k``. Coverage does not depend on the relevance rule. If there
+    are fewer than ``k`` representatives, all of them are used (``passages.is_truncated`` reports it).
+    """
+    from app.rag.evaluation.passages import representatives
+
+    units = _units(question)
+    _check_k(k)
+    chunks = [item.chunk for item in representatives(ranking)[:k]]
+    total = sum((max(span_coverage(chunks, span) for span in unit.spans) for unit in units), Fraction(0))
+    return float(total / len(units))
