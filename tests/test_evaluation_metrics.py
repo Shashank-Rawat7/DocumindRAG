@@ -13,6 +13,8 @@ J  invalid input: TypeError for a wrong type, ValueError for a bad value
 K  purity: no mutation, no reordering, determinism
 L  error messages never contain input content
 M  import isolation
+N  distinct-passage metrics (distinct_hit_at_k, distinct_reciprocal_rank; the grouping itself is
+   tested in test_evaluation_passages.py)
 """
 import dataclasses
 import subprocess
@@ -730,3 +732,214 @@ def test_importing_the_module_loads_no_heavy_dependencies():
     )
     result = subprocess.run([sys.executable, "-c", code], cwd=PROJECT_ROOT, capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "[]"
+
+
+# ---------- N. distinct-passage metrics ----------
+
+def fillers(first_rank, last_rank):
+    return [chunk("doc-z", 100 * rank, 100 * rank + 10) for rank in range(first_rank, last_rank + 1)]
+
+
+def redundant_then_relevant():
+    """Ranks 1-3 are three chunks of one passage of doc-b (irrelevant); rank 4 is the gold span."""
+    return [
+        chunk("doc-b", 0, 100), chunk("doc-b", 50, 150), chunk("doc-b", 100, 200),
+        chunk("doc-a", 1000, 1100),
+    ]
+
+
+def test_distinct_hit_can_exceed_raw_hit_when_deduplication_moves_a_passage_up():
+    q = single(1000, 1100)
+    ranking = redundant_then_relevant()
+    assert [mt.hit_at_k(q, ranking, k) for k in (1, 2, 3, 4)] == [0, 0, 0, 1]
+    assert [mt.distinct_hit_at_k(q, ranking, k) for k in (1, 2, 3, 4)] == [0, 1, 1, 1]
+    assert mt.distinct_hit_at_k(q, ranking, 2) > mt.hit_at_k(q, ranking, 2)
+
+
+def test_distinct_reciprocal_rank_uses_the_compressed_position():
+    q = single(1000, 1100)
+    ranking = redundant_then_relevant()
+    assert mt.reciprocal_rank(q, ranking) == 1 / 4
+    assert mt.distinct_reciprocal_rank(q, ranking) == 1 / 2
+
+
+def test_distinct_metrics_equal_the_raw_ones_when_no_chunks_merge():
+    for k in mt.CUTOFFS:
+        assert mt.distinct_hit_at_k(WORKED, WORKED_RANKING, k) == mt.hit_at_k(WORKED, WORKED_RANKING, k)
+    assert mt.distinct_reciprocal_rank(WORKED, WORKED_RANKING) == mt.reciprocal_rank(WORKED, WORKED_RANKING) == 0.5
+
+
+def test_a_redundant_chunk_ahead_of_the_first_relevant_one_improves_the_distinct_rank():
+    ranking = [chunk("doc-c", 0, 500), chunk("doc-c", 100, 200), chunk("doc-a", 0, 60)]
+    assert mt.reciprocal_rank(WORKED, ranking) == 1 / 3
+    assert mt.distinct_reciprocal_rank(WORKED, ranking) == 1 / 2
+    assert mt.hit_at_k(WORKED, ranking, 2) == 0
+    assert mt.distinct_hit_at_k(WORKED, ranking, 2) == 1
+
+
+def test_a_relevant_later_member_gets_no_credit_when_its_representative_is_not_relevant():
+    q = single(20, 30)
+    ranking = [chunk("doc-a", 0, 10), chunk("doc-a", 20, 30), chunk("doc-a", 10, 21)]  # one passage, rep rank 1
+    assert mt.hit_at_k(q, ranking, 2) == 1 and mt.reciprocal_rank(q, ranking) == 1 / 2
+    assert mt.distinct_hit_at_k(q, ranking, 3) == 0
+    assert mt.distinct_reciprocal_rank(q, ranking) == 0.0
+
+
+def test_the_intervals_of_a_passage_are_not_combined_to_reach_the_threshold():
+    q = single(0, 100)
+    ranking = [chunk("doc-a", 0, 40), chunk("doc-a", 35, 75)]  # one passage covering 75%, each part 40%
+    assert mt.evidence_coverage_at_k(q, ranking, 2) == 0.75
+    assert mt.distinct_hit_at_k(q, ranking, 2) == 0
+    assert mt.distinct_reciprocal_rank(q, ranking) == 0.0
+
+
+def test_a_relevant_representative_counts_whatever_its_later_members_are():
+    q = single(0, 100)
+    ranking = [chunk("doc-a", 0, 60), chunk("doc-a", 55, 70)]
+    assert mt.distinct_hit_at_k(q, ranking, 1) == 1
+    assert mt.distinct_reciprocal_rank(q, ranking) == 1.0
+
+
+def bridge_ranking(total):
+    """Gold [20, 30). Rank 1 (0,10) is irrelevant, rank 2 (20,30) is relevant, and a chunk
+    (10,21) touches the first and overlaps the second by one position, so it bridges them."""
+    return [chunk("doc-a", 0, 10), chunk("doc-a", 20, 30)] + fillers(3, total - 1) + [chunk("doc-a", 10, 21)]
+
+
+def test_a_bridge_at_rank_20_changes_distinct_metrics_at_small_k():
+    q = single(20, 30)
+    ranking = bridge_ranking(20)
+    assert len(ranking) == 20
+    assert mt.hit_at_k(q, ranking, 2) == 1 and mt.reciprocal_rank(q, ranking) == 1 / 2  # raw: unaffected
+    assert [mt.distinct_hit_at_k(q, ranking, k) for k in (1, 2, 5, 20)] == [0, 0, 0, 0]
+    assert mt.distinct_reciprocal_rank(q, ranking) == 0.0
+
+
+def test_the_same_chunk_at_rank_21_changes_nothing():
+    q = single(20, 30)
+    ranking = bridge_ranking(21)
+    assert len(ranking) == 21
+    assert [mt.distinct_hit_at_k(q, ranking, k) for k in (1, 2, 5, 20)] == [0, 1, 1, 1]
+    assert mt.distinct_reciprocal_rank(q, ranking) == 1 / 2
+
+
+def test_distinct_metrics_depend_only_on_the_first_20_chunks():
+    q = single(1000, 1100)
+    ranking = fillers(1, 20) + [chunk("doc-a", 1000, 1100)]
+    assert mt.distinct_hit_at_k(q, ranking, 20) == 0 and mt.distinct_reciprocal_rank(q, ranking) == 0.0
+
+
+def test_k_counts_compressed_positions_and_may_exceed_the_number_of_representatives():
+    q = single(1000, 1100)
+    ranking = redundant_then_relevant()
+    assert mt.distinct_hit_at_k(q, ranking, 20) == 1
+    assert mt.distinct_hit_at_k(q, ranking[:3], 20) == 0
+
+
+@pytest.mark.parametrize(
+    "end, any_overlap, half, full",
+    [(1, 1, 0, 0), (49, 1, 0, 0), (50, 1, 1, 0), (99, 1, 1, 0), (100, 1, 1, 1)],
+)
+def test_all_three_relevance_rules_apply_to_the_representative(end, any_overlap, half, full):
+    q = single(0, 100)
+    ranking = [chunk("doc-b", 0, 5), chunk("doc-b", 3, 8), chunk("doc-a", 0, end)]
+    got = [mt.distinct_hit_at_k(q, ranking, 2, rule) for rule in (mt.ANY_OVERLAP, mt.HALF_COVERAGE, mt.FULL_COVERAGE)]
+    assert got == [any_overlap, half, full]
+    rr = [mt.distinct_reciprocal_rank(q, ranking, rule) for rule in mt.RELEVANCE_RULES]
+    assert rr == [0.5 * flag for flag in (any_overlap, half, full)]
+
+
+def test_distinct_metrics_on_empty_and_short_rankings():
+    for empty in ([], ()):
+        assert mt.distinct_hit_at_k(WORKED, empty, 5) == 0
+        assert mt.distinct_reciprocal_rank(WORKED, empty) == 0.0
+    assert mt.distinct_hit_at_k(single(0, 100), [chunk("doc-a", 0, 100)], 1) == 1
+    assert mt.distinct_reciprocal_rank(single(0, 100), (chunk("doc-a", 0, 100),)) == 1.0
+
+
+def test_a_unit_can_be_satisfied_by_any_representative_and_units_stay_independent():
+    q = question(unit("u1", span("doc-a", 0, 10)), unit("u2", span("doc-a", 500, 510)))
+    ranking = [chunk("doc-a", 0, 10), chunk("doc-a", 5, 12), chunk("doc-a", 500, 510)]
+    assert mt.distinct_hit_at_k(q, ranking, 1) == 1
+    assert mt.distinct_reciprocal_rank(q, ranking) == 1.0
+
+
+def test_distinct_results_have_exact_types():
+    q = single(1000, 1100)
+    assert type(mt.distinct_hit_at_k(q, redundant_then_relevant(), 2)) is int
+    assert type(mt.distinct_reciprocal_rank(q, redundant_then_relevant())) is float
+
+
+@pytest.mark.parametrize("k", [True, False, 1.0, "5", None])
+def test_distinct_k_of_the_wrong_type_is_a_type_error(k):
+    with pytest.raises(TypeError):
+        mt.distinct_hit_at_k(WORKED, WORKED_RANKING, k)
+
+
+@pytest.mark.parametrize("k", [0, -1, 21])
+def test_distinct_k_outside_1_to_20_is_a_value_error(k):
+    with pytest.raises(ValueError):
+        mt.distinct_hit_at_k(WORKED, WORKED_RANKING, k)
+
+
+@pytest.mark.parametrize("ranking", [None, "abc", "", {}, set(), 5, (c for c in [])])
+def test_a_distinct_ranking_must_be_a_list_or_tuple(ranking):
+    with pytest.raises(TypeError):
+        mt.distinct_hit_at_k(WORKED, ranking, 5)
+    with pytest.raises(TypeError):
+        mt.distinct_reciprocal_rank(WORKED, ranking)
+
+
+def test_a_distinct_ranking_item_among_the_first_20_must_be_a_ranked_chunk_and_later_ones_are_ignored():
+    with pytest.raises(TypeError):
+        mt.distinct_hit_at_k(WORKED, [chunk("doc-a", 0, 5), None], 5)
+    with pytest.raises(TypeError):
+        mt.distinct_reciprocal_rank(WORKED, fillers(1, 19) + ["x"])
+    assert mt.distinct_reciprocal_rank(WORKED, fillers(1, 20) + ["x"]) == 0.0
+
+
+def test_distinct_metrics_validate_the_question_and_the_rule():
+    unanswerable = question(answerable=False, units=(), expected_answer=None, source_language=None,
+                            difficulty=None, close_distractor=None)
+    with pytest.raises(ValueError):
+        mt.distinct_hit_at_k(unanswerable, WORKED_RANKING, 5)
+    with pytest.raises(TypeError):
+        mt.distinct_reciprocal_rank("q", WORKED_RANKING)
+    with pytest.raises(ValueError):
+        mt.distinct_hit_at_k(WORKED, WORKED_RANKING, 5, "half")
+    with pytest.raises(TypeError):
+        mt.distinct_reciprocal_rank(WORKED, WORKED_RANKING, None)
+    bad = dataclasses.replace(WORKED, units=(unit("u1", s.Span("doc-a", SHA, True, 5, "x", SHA)),))
+    with pytest.raises(TypeError):
+        mt.distinct_hit_at_k(bad, [], 5)
+
+
+def test_distinct_metrics_do_not_modify_or_reorder_their_inputs_and_are_deterministic():
+    q = single(1000, 1100)
+    ranking = redundant_then_relevant()
+    snapshot = list(ranking)
+    first = (mt.distinct_hit_at_k(q, ranking, 2), mt.distinct_reciprocal_rank(q, ranking))
+    assert (mt.distinct_hit_at_k(q, ranking, 2), mt.distinct_reciprocal_rank(q, ranking)) == first
+    assert ranking == snapshot and all(a is b for a, b in zip(ranking, snapshot))
+
+
+def test_distinct_error_messages_never_contain_input_content():
+    calls = [
+        lambda: mt.distinct_hit_at_k(WORKED, [CANARY], 5),
+        lambda: mt.distinct_hit_at_k(WORKED, CANARY, 5),
+        lambda: mt.distinct_reciprocal_rank(WORKED, WORKED_RANKING, CANARY),
+        lambda: mt.distinct_hit_at_k(CANARY, WORKED_RANKING, 5),
+    ]
+    for call in calls:
+        with pytest.raises((TypeError, ValueError)) as caught:
+            call()
+        assert CANARY not in str(caught.value)
+
+
+def test_the_raw_metrics_are_unchanged_by_the_distinct_ones():
+    ranking = redundant_then_relevant()
+    q = single(1000, 1100)
+    before = [mt.hit_at_k(q, ranking, k) for k in mt.CUTOFFS] + [mt.reciprocal_rank(q, ranking)]
+    mt.distinct_hit_at_k(q, ranking, 2)
+    mt.distinct_reciprocal_rank(q, ranking)
+    assert [mt.hit_at_k(q, ranking, k) for k in mt.CUTOFFS] + [mt.reciprocal_rank(q, ranking)] == before

@@ -26,6 +26,14 @@ Metrics, all over the first ``k`` chunks (``k`` is 1 to ``MAX_RANK``; the usual 
     unit, looking only at the first ``MAX_RANK`` chunks; 0 if there is none. (MRR is the mean
     of this over questions, computed in a later checkpoint.)
 
+Distinct-passage metrics (``distinct_hit_at_k``, ``distinct_reciprocal_rank``) apply the same
+definitions to the representatives of ``passages.representatives`` instead of to the raw chunks:
+the ranking is collapsed to one chunk per passage (see that module for the rules, including the
+consequence of building passages from all 20 chunks), and ``k`` and the reciprocal rank count
+positions in that compressed ranking, not original ranks. Relevance is judged on the
+representative chunk alone. These are separate from the raw metrics, which stay primary. Because
+the compressed ranking can move a relevant passage up, a distinct Hit@k can exceed the raw Hit@k.
+
 Fractions are computed exactly and converted to ``float`` once at the end.
 
 Errors follow the E1.2 convention of ``near_duplicates`` and ``structure``: ``TypeError`` for an
@@ -198,11 +206,16 @@ def _units(question: object) -> tuple[EvidenceUnit, ...]:
     return units
 
 
-def _top(ranking: object, k: object) -> list[RankedChunk]:
+def _check_k(k: object) -> int:
     if type(k) is not int:
         raise TypeError("k must be an int")
     if not 1 <= k <= MAX_RANK:
         raise ValueError("k must be from 1 to the maximum rank")
+    return k
+
+
+def _top(ranking: object, k: object) -> list[RankedChunk]:
+    _check_k(k)
     if not isinstance(ranking, (list, tuple)):
         raise TypeError("ranking must be a list or tuple of RankedChunk")
     return [_check_chunk(chunk) for chunk in ranking[:k]]
@@ -247,4 +260,33 @@ def reciprocal_rank(question: Question, ranking: Sequence[RankedChunk], rule: st
     for rank, chunk in enumerate(chunks, start=1):
         if any(_relevant(chunk, span, rule) for span in spans):
             return float(Fraction(1, rank))
+    return 0.0
+
+
+# ---------- distinct-passage metrics ----------
+
+def distinct_hit_at_k(question: Question, ranking: Sequence[RankedChunk], k: int, rule: str = DEFAULT_RULE) -> int:
+    """1 if a required unit is satisfied by one of the first ``k`` representatives, else 0.
+
+    ``k`` counts positions in the compressed representative ranking (see ``passages``).
+    """
+    from app.rag.evaluation.passages import representatives
+
+    _check_rule(rule)
+    units = _units(question)
+    _check_k(k)
+    chunks = [item.chunk for item in representatives(ranking)[:k]]
+    return 1 if any(_unit_satisfied(unit, chunks, rule) for unit in units) else 0
+
+
+def distinct_reciprocal_rank(question: Question, ranking: Sequence[RankedChunk], rule: str = DEFAULT_RULE) -> float:
+    """1 / the compressed position of the first relevant representative, else 0.0."""
+    from app.rag.evaluation.passages import representatives
+
+    _check_rule(rule)
+    units = _units(question)
+    spans = [span for unit in units for span in unit.spans]
+    for position, item in enumerate(representatives(ranking), start=1):
+        if any(_relevant(item.chunk, span, rule) for span in spans):
+            return float(Fraction(1, position))
     return 0.0
