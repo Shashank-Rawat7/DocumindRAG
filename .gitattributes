@@ -1,0 +1,2 @@
+eval/corpus/** text eol=lf
+eval/corpus/**/*.pdf binary
