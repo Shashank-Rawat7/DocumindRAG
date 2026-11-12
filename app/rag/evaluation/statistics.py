@@ -39,6 +39,32 @@ legitimate, but it still only describes the sample. As with Wilson, questions ab
 source document are probably correlated, so the interval is likely narrower than the real
 uncertainty; no document-level resampling is done.
 
+Checkpoint c: ``paired_bootstrap_interval``, the question-level percentile bootstrap interval for
+the mean difference between a candidate and a baseline retrieval version (candidate minus
+baseline), for a continuous metric or for a binary one such as Hit@k (``binary=True``). The two
+versions must have been scored on exactly the same questions. The pairing is what makes the
+comparison valid, and it works like this:
+
+  1. Each input is aligned by question id (sorted), after both id sets are checked to be
+     identical, so the order the observations arrive in cannot matter.
+  2. The per-question difference ``candidate - baseline`` is formed. The differences may be
+     negative; only the inputs are range-checked, never the differences.
+  3. The differences are resampled with the same machinery as the ordinary bootstrap. Each
+     resample draws one set of question indices, and one drawn index stands for both versions'
+     values for that question, so the mean of the drawn differences is exactly the candidate's
+     resampled mean minus the baseline's under the same indices. The two versions are never
+     resampled separately.
+  4. The nearest-rank percentile limits are the same as for the ordinary bootstrap. Because of
+     that convention, swapping the two versions negates ``mean_difference`` and every resampled
+     difference exactly, but it does not always mirror the two limits exactly: the lower and
+     upper ranks (250 and 9,750 at 10,000 resamples) do not add up to B + 1.
+
+The interval is not a test of significance and is not a combination of the two versions'
+own intervals. This module checks only that the observations have the same question ids. It
+cannot know whether the labels behind them are the same: the caller (the evaluation runner)
+must verify that both versions were scored against the identical locked dataset and labels
+before comparing them.
+
 The confidence level is fixed at 95% (``CONFIDENCE_LEVEL``); the normal quantile used is
 1.959963984540054. This is the plain Wilson score interval, without a continuity correction.
 Its limits are clamped to [0, 1], and a limit is exactly 0.0 when there are no successes and
@@ -247,4 +273,86 @@ def bootstrap_mean_interval(
     return BootstrapInterval(
         len(values), math.fsum(values) / len(values), lower, upper, resamples, seed,
         CONFIDENCE_LEVEL, BOOTSTRAP_METHOD, PERCENTILE_CONVENTION,
+    )
+
+
+# ---------- paired bootstrap: candidate minus baseline on the same questions ----------
+
+PAIRED_BOOTSTRAP_METHOD = "paired_percentile_bootstrap"
+
+_ID_SET_MESSAGE = "baseline and candidate must have the same question ids"
+_BINARY_FLAG_MESSAGE = "binary must be a bool"
+_BINARY_VALUE_MESSAGE = "a binary observation must be 0 or 1"
+
+
+@dataclass(frozen=True, slots=True)
+class PairedBootstrapInterval:
+    """A percentile bootstrap interval for a mean difference (candidate minus baseline).
+
+    ``mean_difference`` is the mean of the observed per-question differences; ``lower`` and
+    ``upper`` are nearest-rank percentiles of the resampled mean differences. Both may be
+    negative.
+    """
+
+    n: int
+    mean_difference: float
+    lower: float
+    upper: float
+    resamples: int
+    seed: int
+    confidence_level: float
+    method: str
+    percentile_convention: str
+
+
+def paired_bootstrap_interval(
+    baseline: Sequence[tuple[str, int | float]],
+    candidate: Sequence[tuple[str, int | float]],
+    seed: int,
+    resamples: int = DEFAULT_RESAMPLES,
+    *,
+    binary: bool = False,
+) -> PairedBootstrapInterval:
+    """The 95% paired percentile bootstrap interval for ``candidate - baseline``.
+
+    ``baseline`` and ``candidate`` are lists or tuples of ``(question_id, value)`` pairs with
+    exactly the same question ids, each id once. Values are finite ``int`` or ``float`` from 0
+    to 1; with ``binary=True`` they must be exactly 0 or 1 (``0``, ``1``, ``0.0`` and ``1.0``
+    are all accepted). ``binary`` only chooses this validation; it does not change the method.
+
+    Raises ``TypeError`` for a wrong type (a ``bool`` is not an int or a number here, and
+    ``binary`` must be a ``bool``). Every type check, on both observation inputs, ``seed``,
+    ``resamples`` and ``binary``, comes before any value check. Raises ``ValueError`` for, in
+    this order: a baseline value outside 0..1 or non-finite, a duplicate baseline id, fewer than
+    2 baseline observations, the same three for the candidate, differing id sets, a value that
+    is not 0 or 1 when ``binary`` is set, a negative ``seed``, ``resamples`` below
+    ``MIN_RESAMPLES``.
+    """
+    baseline_pairs = _observation_pairs(baseline)
+    candidate_pairs = _observation_pairs(candidate)
+    if type(seed) is not int:
+        raise TypeError(_INT_MESSAGE.format(name="seed"))
+    if type(resamples) is not int:
+        raise TypeError(_INT_MESSAGE.format(name="resamples"))
+    if type(binary) is not bool:
+        raise TypeError(_BINARY_FLAG_MESSAGE)
+    baseline_values = _sorted_values(baseline_pairs)
+    candidate_values = _sorted_values(candidate_pairs)
+    if sorted(question_id for question_id, _ in baseline_pairs) != sorted(
+        question_id for question_id, _ in candidate_pairs
+    ):
+        raise ValueError(_ID_SET_MESSAGE)
+    if binary and any(value != 0.0 and value != 1.0 for value in baseline_values + candidate_values):
+        raise ValueError(_BINARY_VALUE_MESSAGE)
+    if seed < 0:
+        raise ValueError(_SEED_MESSAGE)
+    if resamples < MIN_RESAMPLES:
+        raise ValueError(_RESAMPLES_MESSAGE)
+
+    # Both lists are ordered by the same ids, so position i is one question in both versions.
+    differences = [after - before for before, after in zip(baseline_values, candidate_values)]
+    lower, upper = _percentile_limits(_resample_means(differences, seed, resamples))
+    return PairedBootstrapInterval(
+        len(differences), math.fsum(differences) / len(differences), lower, upper, resamples, seed,
+        CONFIDENCE_LEVEL, PAIRED_BOOTSTRAP_METHOD, PERCENTILE_CONVENTION,
     )
