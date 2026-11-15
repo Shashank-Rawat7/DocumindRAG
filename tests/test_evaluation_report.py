@@ -34,6 +34,7 @@ from app.rag.evaluation import freeze_binding as fb
 from app.rag.evaluation import pool as p
 from app.rag.evaluation import report as rep
 from app.rag.evaluation import schema as s
+from app.rag.evaluation import score_diagnostics as sd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OWNER = 481516          # unusual on purpose: it must never appear in a report
@@ -586,7 +587,30 @@ CODE_IDENTITY_BEFORE_E2_2 = (
 )
 FREEZE_FIELDS = tuple(f.name for f in dataclasses.fields(fb.FreezeBinding))
 HASH_FIELDS = tuple(name for name in FREEZE_FIELDS if name.endswith("_sha256"))
-BASELINE_ONLY_KEYS = ("kind", "label", "report_format_version", "scope", "freeze_binding")
+# CODE_IDENTITY_MODULES at E2.2 (E2.3 then added the score-diagnostics module).
+CODE_IDENTITY_BEFORE_E2_3 = tuple(sorted((*CODE_IDENTITY_BEFORE_E2_2, "app.rag.evaluation.freeze_binding")))
+BASELINE_ONLY_KEYS = ("kind", "label", "report_format_version", "scope", "freeze_binding", "score_diagnostics",
+                      "unanswerable")
+
+
+_SECTIONS = {}
+
+
+def unanswerable_retriever(query):
+    """A deterministic ranking for the unanswerable dev questions, with strictly decreasing scores."""
+    return [dataclasses.replace(CHUNKS[i], score=0.5 - 0.0625 * n) for n, i in enumerate(range(1, 7))]
+
+
+def diagnostics_of(bundle):
+    """The score_diagnostics section for the bundle's run (built once per run, returned as a fresh copy)."""
+    run, inputs, pool = bundle
+    if id(run) not in _SECTIONS:
+        recorder = sd.ScoreRecorder(retriever)
+        for question in inputs.answerable:  # the engine's calls, in dev-file order
+            recorder(question.question)
+        _SECTIONS[id(run)] = sd.build_score_diagnostics(
+            run, inputs, pool, recorder.take(), sd.collect_unanswerable_scores(inputs, pool, unanswerable_retriever))
+    return copy.deepcopy(_SECTIONS[id(run)])
 
 
 def freeze_of(run, **over):
@@ -602,7 +626,7 @@ def freeze_of(run, **over):
 
 @pytest.fixture(scope="module")
 def baseline(bundle):
-    return rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]))
+    return rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze_of(bundle[0]))
 
 
 def tampered(document, change):
@@ -637,11 +661,13 @@ def test_a_pilot_report_takes_no_freeze_binding(bundle):
 
 # --- K2: the code identity changes by design; the document contract does not ---
 
-def test_the_only_new_identity_module_is_the_freeze_binding_gate():
+def test_the_new_identity_modules_are_the_freeze_binding_gate_and_the_score_diagnostics():
+    added = {"app.rag.evaluation.freeze_binding", "app.rag.evaluation.score_diagnostics"}
     assert list(rep.CODE_IDENTITY_MODULES) == sorted(rep.CODE_IDENTITY_MODULES)
-    assert set(rep.CODE_IDENTITY_MODULES) - set(CODE_IDENTITY_BEFORE_E2_2) == {"app.rag.evaluation.freeze_binding"}
+    assert set(rep.CODE_IDENTITY_MODULES) - set(CODE_IDENTITY_BEFORE_E2_2) == added
     assert set(CODE_IDENTITY_BEFORE_E2_2) <= set(rep.CODE_IDENTITY_MODULES)
-    assert "app.rag.evaluation.freeze_binding" in dict(rep.compute_code_identity().files)
+    assert set(rep.CODE_IDENTITY_MODULES) - set(CODE_IDENTITY_BEFORE_E2_3) == {"app.rag.evaluation.score_diagnostics"}
+    assert added <= set(dict(rep.compute_code_identity().files))
 
 
 def test_the_real_pilot_code_identity_changes_by_design_while_the_document_contract_does_not(bundle):
@@ -650,13 +676,13 @@ def test_the_real_pilot_code_identity_changes_by_design_while_the_document_contr
     def stable(name):  # one hash per module NAME, the same in both identities
         return rep.hash_source_bytes(name.encode("utf-8"))
 
-    added = "app.rag.evaluation.freeze_binding"
-    old = rep.combine_identity({m: stable(m) for m in CODE_IDENTITY_BEFORE_E2_2})
+    added = "app.rag.evaluation.score_diagnostics"  # E2.3 added exactly one module to the E2.2 list
+    old = rep.combine_identity({m: stable(m) for m in CODE_IDENTITY_BEFORE_E2_3})
     new = rep.combine_identity({m: stable(m) for m in rep.CODE_IDENTITY_MODULES})
     old_files, new_files = dict(old.files), dict(new.files)
-    assert len(old_files) == 22 and len(new_files) == 23
+    assert len(old_files) == 23 and len(new_files) == 24
     assert set(new_files) - set(old_files) == {added} and set(old_files) <= set(new_files)
-    assert all(new_files[m] == old_files[m] for m in old_files)  # the 22 existing hashes are unchanged
+    assert all(new_files[m] == old_files[m] for m in old_files)  # the 23 existing hashes are unchanged
     assert new_files[added] == stable(added)
     assert old.combined_sha256 != new.combined_sha256
     before = rep.render_report(*bundle, meta(code_identity=old))
@@ -676,7 +702,7 @@ def test_the_real_pilot_code_identity_changes_by_design_while_the_document_contr
 def test_the_baseline_identifies_itself_as_retrieval_only_dense_dev_and_not_a_v1_baseline(baseline):
     doc = baseline.document
     assert doc["kind"] == "retrieval_baseline" and doc["is_v1_baseline"] is False
-    assert doc["report_format_version"] == "e2.2-report-1"
+    assert doc["report_format_version"] == "e2.3-report-1"
     assert doc["label"] == "Retrieval-only dense V1 baseline (dev split) — not the full V1 RAG baseline"
     assert doc["scope"] == {
         "stage": "retrieval_only", "retrieval": "dense", "retrieval_version": "dense-v1", "split": "dev",
@@ -689,14 +715,19 @@ def test_the_baseline_identifies_itself_as_retrieval_only_dense_dev_and_not_a_v1
 def test_the_baseline_holds_the_supplied_binding_and_the_same_sections_as_a_pilot(bundle, baseline, rendered):
     assert baseline.document["freeze_binding"] == dataclasses.asdict(freeze_of(bundle[0]))
     assert set(baseline.document["freeze_binding"]) == set(FREEZE_FIELDS) and len(FREEZE_FIELDS) == 9
-    assert set(baseline.document) == set(rendered.document) | {"scope", "freeze_binding"}
+    assert set(baseline.document) == set(rendered.document) | {"scope", "freeze_binding", "score_diagnostics"}
     for key in set(rendered.document) - set(BASELINE_ONLY_KEYS):
         assert baseline.document[key] == rendered.document[key], key
+    # the unanswerable section differs from the pilot's only in its note (the questions are retrieved for scores)
+    pilot_part, baseline_part = dict(rendered.document["unanswerable"]), dict(baseline.document["unanswerable"])
+    assert pilot_part.pop("note") == rep.UNANSWERABLE_NOTE
+    assert baseline_part.pop("note") == rep.UNANSWERABLE_DIAGNOSTIC_NOTE
+    assert pilot_part == baseline_part and baseline_part["retrieval_metrics"] is None
     assert baseline.document["oracle"]["questions"] and baseline.document["random"]["questions"]  # reference rows
 
 
 def test_the_baseline_bytes_are_deterministic_canonical_and_round_trip(bundle, baseline):
-    again = rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]))
+    again = rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze_of(bundle[0]))
     assert again.json_bytes == baseline.json_bytes and again.sha256 == baseline.sha256
     assert rep.load_report(baseline.json_bytes) == baseline.document
     assert rep.serialize_report(rep.load_report(baseline.json_bytes)) == baseline.json_bytes
@@ -712,14 +743,14 @@ def test_the_baseline_run_hashes_are_the_canonical_hashes_not_the_raw_file_hash(
     assert freeze["manifest_file_sha256"] not in (run.manifest_sha256, run.dev_dataset_sha256)
     # the raw file hash is recorded, not compared with the run
     other = freeze_of(run, manifest_file_sha256="e" * 64)
-    built = rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=other)
+    built = rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=other)
     assert built["freeze_binding"]["manifest_file_sha256"] == "e" * 64
 
 
 def test_the_baseline_report_still_refuses_dev_text(bundle):
     leak = fx.Q1.question
     refused(rep.REPORT_LEAK, rep.build_report, *bundle, meta(embedder_signature=leak),
-            kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]))
+            kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze_of(bundle[0]))
 
 
 # --- K4: build refusals ---
@@ -727,12 +758,12 @@ def test_the_baseline_report_still_refuses_dev_text(bundle):
 @pytest.mark.parametrize("value", [None, {}, "x", dataclasses.asdict, 1])
 def test_a_baseline_requires_a_freeze_binding_object(bundle, value):
     with pytest.raises(TypeError):
-        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=value)
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=value)
 
 
 def test_a_dict_that_looks_like_a_binding_is_not_accepted(bundle):
     with pytest.raises(TypeError):
-        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=dataclasses.asdict(freeze_of(bundle[0])))
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=dataclasses.asdict(freeze_of(bundle[0])))
 
 
 @pytest.mark.parametrize("kind", ["", "pilot", "Retrieval_Baseline", "v1_baseline", None, 1, b"retrieval_baseline"])
@@ -749,7 +780,7 @@ def test_an_unknown_report_kind_is_refused(bundle, kind):
 def test_a_malformed_binding_is_refused_with_a_fixed_message(bundle, over):
     freeze = freeze_of(bundle[0], **over)
     with pytest.raises(s.EvaluationDataError) as info:
-        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze)
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze)
     assert {i.code for i in info.value.issues} == {rep.REPORT_FREEZE_INVALID}
     assert all(i.message == rep._MESSAGES[rep.REPORT_FREEZE_INVALID] for i in info.value.issues)
     assert "2026-13-45" not in repr(info.value.issues) and "eval-dataset-v1.0" not in repr(info.value.issues)
@@ -758,7 +789,7 @@ def test_a_malformed_binding_is_refused_with_a_fixed_message(bundle, over):
 @pytest.mark.parametrize("field", ["dev_label_binding_sha256", "canonical_manifest_sha256"])
 def test_a_binding_that_disagrees_with_the_run_is_refused(bundle, field):
     freeze = freeze_of(bundle[0], **{field: "f" * 64})
-    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze)
+    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze)
     assert rep._MESSAGES[rep.REPORT_FREEZE_MISMATCH] and "f" * 64 not in repr(rep._MESSAGES)
 
 
@@ -766,21 +797,21 @@ def test_the_raw_manifest_hash_is_not_accepted_in_place_of_the_canonical_one(bun
     run = bundle[0]
     # a raw-file-style hash, not the run's canonical one
     freeze = freeze_of(run, canonical_manifest_sha256="d" * 64)
-    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze)
+    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze)
     swapped = freeze_of(run, dev_label_binding_sha256=run.manifest_sha256,
                         canonical_manifest_sha256=run.dev_dataset_sha256)
-    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, freeze=swapped)
+    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=swapped)
 
 
 def test_the_baseline_keeps_every_existing_verification(bundle):
     run, inputs, pool = bundle
     freeze = freeze_of(run)
     refused(rep.REPORT_HASH_MISMATCH, rep.build_report, dataclasses.replace(run, pool_size=7), inputs, pool, meta(),
-            kind=rep.BASELINE_KIND, freeze=freeze)
+            kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze)
     refused(rep.REPORT_EMBEDDER_MISMATCH, rep.build_report, run, inputs, pool, meta(embedder_id="other"),
-            kind=rep.BASELINE_KIND, freeze=freeze)
+            kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze)
     refused(rep.REPORT_METADATA_INVALID, rep.build_report, run, inputs, pool, meta(git_commit="xyz"),
-            kind=rep.BASELINE_KIND, freeze=freeze)
+            kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze)
 
 
 # --- K5: strict loading ---
@@ -898,8 +929,20 @@ def retargeted(document, field, value):
     return tampered(document, change)
 
 
+def with_answerable(document, indices):
+    """Keep the answerable questions ``indices`` (in that order) in the dense section AND the diagnostics, so
+    the document stays internally valid and only the compared identity changes."""
+    section = document["score_diagnostics"]
+    rows = section["questions"]["answerable"]
+    document["dense"]["questions"] = [document["dense"]["questions"][i] for i in indices]
+    answerable = [sd.QuestionScores(rows[i]["question_id"], tuple(rows[i]["scores"])) for i in indices]
+    unanswerable = [sd.QuestionScores(r["question_id"], tuple(r["scores"])) for r in section["questions"]["unanswerable"]]
+    document["score_diagnostics"] = sd._section(
+        section["ranking_length"], answerable, unanswerable, section["second_pass_scores_sha256"])
+
+
 def other_baseline(bundle, **over):
-    return rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0], **over))
+    return rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, score_diagnostics=diagnostics_of(bundle), freeze=freeze_of(bundle[0], **over))
 
 
 def test_two_baselines_of_the_same_run_are_comparable(bundle, baseline):
@@ -944,8 +987,8 @@ def test_a_baseline_without_a_valid_freeze_binding_cannot_be_compared(baseline, 
                d["freeze_binding"].update(canonical_manifest_sha256="e" * 64)),
     lambda d: (d["inputs"]["dev_dataset"].update(sha256="e" * 64),
                d["freeze_binding"].update(dev_label_binding_sha256="e" * 64)),
-    lambda d: d["dense"].update(questions=list(reversed(d["dense"]["questions"]))),
-    lambda d: d["dense"].update(questions=d["dense"]["questions"][:-1]),
+    lambda d: with_answerable(d, [3, 2, 1, 0]),
+    lambda d: with_answerable(d, [0, 1, 2]),
     lambda d: d["settings"].update(cutoffs=d["settings"]["cutoffs"] + [99]),
     lambda d: d["settings"].update(relevance_rules=list(reversed(d["settings"]["relevance_rules"]))),
     lambda d: d["settings"]["series"]["binary_hit"][0].update(name="renamed"),
@@ -1040,3 +1083,142 @@ def test_the_baseline_document_holds_no_path_credential_or_test_split_content(ba
     text = baseline.json_bytes.decode("utf-8")
     assert "test.jsonl" not in text and "eval/dataset" not in text
     assert baseline.document["inputs"]["dev_dataset"]["test_split_read"] is False
+
+
+# ---------- L: E2.3 the score_diagnostics section of the baseline ----------
+
+def _scores_tampered(baseline, change):
+    return tampered(baseline.document, change)
+
+
+def _recomputed(document, answerable_vectors=None, second=None):
+    """The section rebuilt from (changed) vectors, so only the NUMBERS differ and the section stays valid."""
+    section = document["score_diagnostics"]
+    rows = section["questions"]
+    a = [sd.QuestionScores(r["question_id"], tuple(answerable_vectors[i] if answerable_vectors else r["scores"]))
+         for i, r in enumerate(rows["answerable"])]
+    u = [sd.QuestionScores(r["question_id"], tuple(r["scores"])) for r in rows["unanswerable"]]
+    return sd._section(section["ranking_length"], a, u, second)
+
+
+def test_a_baseline_holds_the_section_and_the_diagnostic_note(bundle, baseline):
+    document = baseline.document
+    assert document["score_diagnostics"] == diagnostics_of(bundle)
+    assert document["unanswerable"]["note"] == rep.UNANSWERABLE_DIAGNOSTIC_NOTE
+    assert document["unanswerable"]["retrieval_metrics"] is None and document["unanswerable"]["count"] == 2
+    assert rep.UNANSWERABLE_DIAGNOSTIC_NOTE != rep.UNANSWERABLE_NOTE
+    assert rep.load_report(baseline.json_bytes) == document
+
+
+def test_the_pilot_document_has_no_score_diagnostics_and_keeps_its_note(rendered):
+    assert "score_diagnostics" not in rendered.document
+    assert rendered.document["unanswerable"]["note"] == rep.UNANSWERABLE_NOTE
+
+
+def test_a_pilot_report_takes_no_score_diagnostics(bundle):
+    with pytest.raises(ValueError):
+        rep.build_report(*bundle, meta(), score_diagnostics=diagnostics_of(bundle))
+    with pytest.raises(ValueError):
+        rep.build_report(*bundle, meta(), kind=rep.REPORT_KIND, score_diagnostics={})
+
+
+@pytest.mark.parametrize("value", [None, "x", [], 1, b"x"])
+def test_a_baseline_requires_a_mapping_for_the_diagnostics(bundle, value):
+    with pytest.raises(TypeError):
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]), score_diagnostics=value)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["groups"]["answerable"]["top1"].update(mean=0.0),
+    lambda d: d["groups"]["unanswerable"].update(tied_adjacent_pairs=99),
+    lambda d: d["groups"]["answerable"]["per_rank"][0].update(median=0.0),
+    lambda d: d["questions"]["answerable"][0]["scores"].__setitem__(0, 0.75),
+    lambda d: d["questions"]["answerable"].reverse(),
+    lambda d: d["questions"]["unanswerable"].pop(),
+    lambda d: d.update(scores_sha256="0" * 64),
+    lambda d: d.update(ranking_length=5),
+    lambda d: d.update(format="e2.3-score-diagnostics-2"),
+    lambda d: d.update(extra=1),
+    lambda d: d.pop("groups"),
+    lambda d: d.update(second_pass_scores_sha256="0" * 64),  # without the matching identical flag
+    lambda d: d.update(second_pass_scores_sha256="A" * 64, scores_identical_across_passes=False),
+])
+def test_a_section_that_does_not_recompute_is_refused_when_building(bundle, change):
+    section = diagnostics_of(bundle)
+    change(section)
+    refused(rep.REPORT_SCORES_INVALID, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND,
+            score_diagnostics=section, freeze=freeze_of(bundle[0]))
+
+
+def test_a_section_for_other_questions_is_refused_when_building(bundle):
+    section = diagnostics_of(bundle)
+    section["questions"]["answerable"][0]["question_id"] = "other"
+    refused(rep.REPORT_SCORES_INVALID, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND,
+            score_diagnostics=section, freeze=freeze_of(bundle[0]))
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["groups"]["answerable"]["spread"].update(max=9.0),
+    lambda d: d["groups"]["answerable"].update(question_count=9),
+    lambda d: d["groups"]["unanswerable"]["per_rank"].pop(),
+    lambda d: d["questions"]["unanswerable"][0]["scores"].reverse(),         # rising: not non-increasing
+    lambda d: d["questions"]["answerable"][0]["scores"].pop(),               # shorter than its ranking
+    lambda d: d["questions"]["answerable"][1].update(scores=[1] * 6),        # ints, not floats
+    lambda d: d["questions"]["answerable"][1]["scores"].__setitem__(0, None),
+    lambda d: d.update(scores_sha256="1" * 64),
+    lambda d: d.update(ranking_length=6.0),
+    lambda d: d.update(scores_identical_across_passes=True),
+    lambda d: d.pop("scores_sha256"),
+    lambda d: d.update(extra=1),
+])
+def test_load_report_and_check_comparable_refuse_an_invalid_section(baseline, change):
+    broken = tampered(baseline.document, lambda document: change(document["score_diagnostics"]))
+    refused(rep.REPORT_INVALID, rep.load_report, rep.serialize_report(broken))
+    for flag in (True, False):
+        refused(rep.REPORT_INVALID, rep.check_comparable, broken, broken, require_same_pool=flag)
+        refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, broken, require_same_pool=flag)
+        refused(rep.REPORT_INVALID, rep.check_comparable, broken, baseline.document, require_same_pool=flag)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.pop("score_diagnostics"),
+    lambda d: d.update(score_diagnostics=None),
+    lambda d: d["unanswerable"].update(note=rep.UNANSWERABLE_NOTE),
+    lambda d: d["unanswerable"].update(note=""),
+    lambda d: d["unanswerable"]["questions"].reverse(),
+    lambda d: d["dense"]["questions"].reverse(),
+    lambda d: d["inputs"]["candidate_pool"].update(size=3),
+])
+def test_load_report_and_check_comparable_refuse_a_baseline_outside_its_diagnostics(baseline, change):
+    broken = tampered(baseline.document, change)
+    refused(rep.REPORT_INVALID, rep.load_report, rep.serialize_report(broken))
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, broken, require_same_pool=False)
+
+
+def test_a_valid_section_with_a_second_pass_hash_round_trips(bundle):
+    document = tampered(rep.render_report(
+        *bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]),
+        score_diagnostics=diagnostics_of(bundle)).document, lambda d: None)
+    document["score_diagnostics"] = _recomputed(document, second=document["score_diagnostics"]["scores_sha256"])
+    assert document["score_diagnostics"]["scores_identical_across_passes"] is True
+    assert rep.load_report(rep.serialize_report(document)) == document
+    other = _recomputed(document, second="a" * 64)
+    assert other["scores_identical_across_passes"] is False  # a mismatch is recorded, not refused
+    document["score_diagnostics"] = other
+    assert rep.load_report(rep.serialize_report(document)) == document
+
+
+def test_baselines_with_different_but_valid_scores_remain_comparable(baseline):
+    vectors = [[0.75, 0.5, 0.5, 0.25, 0.25, 0.0]] * 4
+    other = tampered(baseline.document, lambda d: d.update(score_diagnostics=_recomputed(d, vectors)))
+    assert other["score_diagnostics"]["scores_sha256"] != baseline.document["score_diagnostics"]["scores_sha256"]
+    rep.check_comparable(baseline.document, other)
+    assert rep.load_report(rep.serialize_report(other)) == other
+
+
+def test_the_baseline_report_holds_no_text_database_id_or_path(bundle, baseline):
+    text = baseline.json_bytes.decode("utf-8")
+    for question in bundle[1].questions:
+        assert question.question not in text
+    assert str(OWNER) not in text and "document_id" not in text and "query_sha256" not in text
+    assert "test.jsonl" not in text and "audit.jsonl" not in text

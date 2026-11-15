@@ -21,6 +21,13 @@ and its canonical manifest hash equals ``run.manifest_sha256`` (``parsing.manife
 hash of ``manifest.json`` is recorded in the binding but is not a report input hash: the report's manifest
 hash is the canonical one. The oracle and random sections stay as reference rows of the same run.
 
+E2.3 adds a required ``score_diagnostics`` section to the baseline (format version ``e2.3-report-1``): the
+descriptive dense-score statistics of ``score_diagnostics.build_score_diagnostics``, numbers only. Because the
+unanswerable dev questions are retrieved for those diagnostics, the baseline's ``unanswerable.note`` is
+``UNANSWERABLE_DIAGNOSTIC_NOTE`` (the pilot keeps ``UNANSWERABLE_NOTE``). ``build_report`` refuses a section
+that is not exactly what the diagnostics module would produce for the run, and ``load_report`` and
+``check_comparable`` refuse a baseline whose section does not recompute from its own score vectors.
+
 Contents. Hashes of the manifest, the dev questions and the candidate pool; the run time and Python
 version; the code identity; the embedder id and signature; the content fingerprints of the
 read-only database snapshots taken before and after the run (when supplied); cutoffs, relevance rules, seeds, bootstrap
@@ -65,6 +72,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.rag.evaluation import baselines, engine
+from app.rag.evaluation import score_diagnostics as sd
 from app.rag.evaluation import statistics as stats
 from app.rag.evaluation.aggregation import (
     MIN_SLICE_QUESTIONS,
@@ -88,7 +96,7 @@ REPORT_FORMAT_VERSION = "e1.7-report-1"
 REPORT_KIND = "validity_pilot"
 REPORT_LABEL = "Validity pilot — not the V1 baseline"
 BASELINE_KIND = "retrieval_baseline"
-BASELINE_FORMAT_VERSION = "e2.2-report-1"
+BASELINE_FORMAT_VERSION = "e2.3-report-1"
 BASELINE_LABEL = "Retrieval-only dense V1 baseline (dev split) — not the full V1 RAG baseline"
 BASELINE_SCOPE = {
     "stage": "retrieval_only", "retrieval": "dense", "retrieval_version": "dense-v1", "split": "dev",
@@ -101,6 +109,10 @@ _CONTRACTS = {
 }
 COMPARISON_NOTE = "Reported only: no dense-versus-random pass/fail threshold is approved or applied."
 UNANSWERABLE_NOTE = "Listed apart: no retrieval was run and no answerable retrieval metric is claimed."
+UNANSWERABLE_DIAGNOSTIC_NOTE = (
+    "Listed apart: retrieved for score diagnostics only; no relevance metric or retrieval metric is computed "
+    "or claimed."
+)
 
 CODE_IDENTITY_MODULES = (
     "app.core.text_extraction",
@@ -120,6 +132,7 @@ CODE_IDENTITY_MODULES = (
     "app.rag.evaluation.report",
     "app.rag.evaluation.runner_inputs",
     "app.rag.evaluation.schema",
+    "app.rag.evaluation.score_diagnostics",
     "app.rag.evaluation.statistics",
     "app.rag.evaluation.structure",
     "app.rag.evaluation.validation",
@@ -144,6 +157,7 @@ REPORT_INVALID = "REPORT_INVALID"
 REPORT_IDENTITY_UNAVAILABLE = "REPORT_IDENTITY_UNAVAILABLE"
 REPORT_FREEZE_INVALID = "REPORT_FREEZE_INVALID"
 REPORT_FREEZE_MISMATCH = "REPORT_FREEZE_MISMATCH"
+REPORT_SCORES_INVALID = "REPORT_SCORES_INVALID"
 
 _MESSAGES = {
     REPORT_HASH_MISMATCH: "a hash of the run disagrees with the inputs or the pool it is reported with",
@@ -158,6 +172,7 @@ _MESSAGES = {
     REPORT_IDENTITY_UNAVAILABLE: "the source of an identity module could not be read",
     REPORT_FREEZE_INVALID: "the freeze binding of the report is malformed",
     REPORT_FREEZE_MISMATCH: "the freeze binding disagrees with the dev-dataset or manifest hash of the run",
+    REPORT_SCORES_INVALID: "the score diagnostics of the report are missing, malformed or disagree with the run",
 }
 
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -364,9 +379,23 @@ def _same_json(first: Any, second: Any) -> bool:
         return False
 
 
+def _scores_ok(document: Mapping[str, Any]) -> bool:
+    """The baseline's unanswerable note and ``score_diagnostics`` section, checked against the document's own
+    question ids, ranking lengths and candidate-pool size (the section recomputes from its score vectors)."""
+    dense = document["dense"]["questions"]
+    unanswerable = document["unanswerable"]
+    return unanswerable["note"] == UNANSWERABLE_DIAGNOSTIC_NOTE and sd.section_ok(
+        document.get("score_diagnostics"),
+        answerable_ids=[q["question_id"] for q in dense],
+        unanswerable_ids=[q["question_id"] for q in unanswerable["questions"]],
+        pool_size=document["inputs"]["candidate_pool"]["size"],
+        answerable_ranking_lengths=[len(q["ranking"]) for q in dense],
+    )
+
+
 def _baseline_extras_ok(document: Mapping[str, Any]) -> bool:
-    """The baseline-only keys of a loaded document: the exact scope, a well-formed freeze binding, and the
-    binding's two run hashes equal to the document's own input hashes."""
+    """The baseline-only keys of a loaded document: the exact scope, a well-formed freeze binding, the
+    binding's two run hashes equal to the document's own input hashes, and valid score diagnostics."""
     section = document.get("freeze_binding")
     if not _same_json(document.get("scope"), BASELINE_SCOPE) or not _freeze_section_ok(section):
         return False
@@ -375,6 +404,7 @@ def _baseline_extras_ok(document: Mapping[str, Any]) -> bool:
         return (
             section["dev_label_binding_sha256"] == inputs["dev_dataset"]["sha256"]
             and section["canonical_manifest_sha256"] == inputs["manifest"]["sha256"]
+            and _scores_ok(document)
         )
     except (KeyError, TypeError):
         return False
@@ -480,20 +510,32 @@ def _truncation(report: Report) -> list[list[int]]:
 def build_report(
     run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata,
     *, kind: str = REPORT_KIND, freeze: FreezeBinding | None = None,
+    score_diagnostics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The JSON-ready report document (plain dicts, lists, strings, ints and finite floats).
 
-    ``kind`` is ``validity_pilot`` (default; ``freeze`` must then be ``None``) or ``retrieval_baseline``
-    (``freeze`` must be the verified ``FreezeBinding`` of the frozen dev inputs).
+    ``kind`` is ``validity_pilot`` (default; ``freeze`` and ``score_diagnostics`` must then be ``None``) or
+    ``retrieval_baseline`` (``freeze`` must be the verified ``FreezeBinding`` of the frozen dev inputs and
+    ``score_diagnostics`` the section built by ``score_diagnostics.build_score_diagnostics`` for this run).
     """
     if type(kind) is not str or kind not in _CONTRACTS:
         raise ValueError("unknown report kind")
-    if kind == REPORT_KIND and freeze is not None:
-        raise ValueError("a validity_pilot report takes no freeze binding")
+    if kind == REPORT_KIND and (freeze is not None or score_diagnostics is not None):
+        raise ValueError("a validity_pilot report takes no freeze binding and no score diagnostics")
     if kind == BASELINE_KIND and not isinstance(freeze, FreezeBinding):
         raise TypeError("a retrieval_baseline report requires a FreezeBinding")
+    if kind == BASELINE_KIND and not isinstance(score_diagnostics, Mapping):
+        raise TypeError("a retrieval_baseline report requires the score diagnostics section")
     _verify(run, inputs, pool, metadata)
     freeze_section = _freeze_document(freeze, run) if kind == BASELINE_KIND else None
+    if kind == BASELINE_KIND and not sd.section_ok(
+        score_diagnostics,
+        answerable_ids=[item.question_id for item in run.questions],
+        unanswerable_ids=[item.question_id for item in run.unanswerable],
+        pool_size=len(pool),
+        answerable_ranking_lengths=[len(item.dense) for item in run.questions],
+    ):
+        raise _fail(REPORT_SCORES_INVALID, "score_diagnostics")
     structure = {q.question_id: derive_structure(q) for q in inputs.answerable}
     ids = run.questions[0].dense_scores.metric_ids if run.questions else ()
 
@@ -583,7 +625,8 @@ def build_report(
             "note": COMPARISON_NOTE, "baseline": "random", "candidate": "dense", "report": run.dense_vs_random,
         },
         "unanswerable": {
-            "note": UNANSWERABLE_NOTE, "count": len(run.unanswerable), "retrieval_metrics": None,
+            "note": UNANSWERABLE_NOTE if kind == REPORT_KIND else UNANSWERABLE_DIAGNOSTIC_NOTE,
+            "count": len(run.unanswerable), "retrieval_metrics": None,
             "questions": list(run.unanswerable),
         },
         "truncation_counts": {
@@ -595,6 +638,7 @@ def build_report(
     if freeze_section is not None:
         document["scope"] = dict(BASELINE_SCOPE)
         document["freeze_binding"] = freeze_section
+        document["score_diagnostics"] = score_diagnostics
     plain = _plain(document)
     _check_no_leak(plain, inputs)
     return plain
@@ -621,8 +665,11 @@ def serialize_report(document: Mapping[str, Any]) -> bytes:
 def render_report(
     run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata,
     *, kind: str = REPORT_KIND, freeze: FreezeBinding | None = None,
+    score_diagnostics: Mapping[str, Any] | None = None,
 ) -> SerializedReport:
-    document = build_report(run, inputs, pool, metadata, kind=kind, freeze=freeze)
+    document = build_report(
+        run, inputs, pool, metadata, kind=kind, freeze=freeze, score_diagnostics=score_diagnostics,
+    )
     data = serialize_report(document)
     return SerializedReport(document, data, hashlib.sha256(data).hexdigest())
 
@@ -631,7 +678,7 @@ def load_report(data: bytes) -> dict[str, Any]:
     """Parse a serialised report and check its kind, version and label (no other validation).
 
     A ``retrieval_baseline`` document is also checked for its exact ``scope`` and a well-formed
-    ``freeze_binding`` that agrees with the document's own input hashes.
+    ``freeze_binding`` that agrees with the document's own input hashes, and valid ``score_diagnostics``.
     """
     if type(data) is not bytes:
         raise TypeError("data must be bytes")
