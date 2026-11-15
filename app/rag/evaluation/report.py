@@ -28,6 +28,14 @@ unanswerable dev questions are retrieved for those diagnostics, the baseline's `
 that is not exactly what the diagnostics module would produce for the run, and ``load_report`` and
 ``check_comparable`` refuse a baseline whose section does not recompute from its own score vectors.
 
+E2.4b adds a required ``ranking_determinism`` section to the baseline (format version ``e2.4-report-1``): the
+D7 ranking hash of ``ranking_hash.ranking_sha256`` as the evidence that two independent dense passes produced
+identical answerable rankings. The validator does not trust the hash: it rebuilds the ranked chunks from the
+document's own ``dense.questions[*].ranking`` and recomputes the digest with ``ranking_hash.ranking_digest``
+(no second serializer), so a well-formed but wrong hash, or an edited ranking, is refused by ``load_report`` and
+``check_comparable`` alike. Two comparable reports need not have equal ranking hashes. The pilot takes no such
+section.
+
 Contents. Hashes of the manifest, the dev questions and the candidate pool; the run time and Python
 version; the code identity; the embedder id and signature; the content fingerprints of the
 read-only database snapshots taken before and after the run (when supplied); cutoffs, relevance rules, seeds, bootstrap
@@ -72,6 +80,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.rag.evaluation import baselines, engine
+from app.rag.evaluation import ranking_hash as rh
 from app.rag.evaluation import score_diagnostics as sd
 from app.rag.evaluation import statistics as stats
 from app.rag.evaluation.aggregation import (
@@ -96,7 +105,7 @@ REPORT_FORMAT_VERSION = "e1.7-report-1"
 REPORT_KIND = "validity_pilot"
 REPORT_LABEL = "Validity pilot — not the V1 baseline"
 BASELINE_KIND = "retrieval_baseline"
-BASELINE_FORMAT_VERSION = "e2.3-report-1"
+BASELINE_FORMAT_VERSION = "e2.4-report-1"
 BASELINE_LABEL = "Retrieval-only dense V1 baseline (dev split) — not the full V1 RAG baseline"
 BASELINE_SCOPE = {
     "stage": "retrieval_only", "retrieval": "dense", "retrieval_version": "dense-v1", "split": "dev",
@@ -107,6 +116,9 @@ _CONTRACTS = {
     REPORT_KIND: (REPORT_FORMAT_VERSION, REPORT_LABEL),
     BASELINE_KIND: (BASELINE_FORMAT_VERSION, BASELINE_LABEL),
 }
+DETERMINISM_FORMAT = "e2.4-determinism-1"
+DETERMINISM_PASSES = 2
+_DETERMINISM_KEYS = frozenset({"format", "passes", "ranking_sha256", "rankings_identical_across_passes"})
 COMPARISON_NOTE = "Reported only: no dense-versus-random pass/fail threshold is approved or applied."
 UNANSWERABLE_NOTE = "Listed apart: no retrieval was run and no answerable retrieval metric is claimed."
 UNANSWERABLE_DIAGNOSTIC_NOTE = (
@@ -129,6 +141,7 @@ CODE_IDENTITY_MODULES = (
     "app.rag.evaluation.parsing",
     "app.rag.evaluation.passages",
     "app.rag.evaluation.pool",
+    "app.rag.evaluation.ranking_hash",
     "app.rag.evaluation.report",
     "app.rag.evaluation.runner_inputs",
     "app.rag.evaluation.schema",
@@ -158,6 +171,7 @@ REPORT_IDENTITY_UNAVAILABLE = "REPORT_IDENTITY_UNAVAILABLE"
 REPORT_FREEZE_INVALID = "REPORT_FREEZE_INVALID"
 REPORT_FREEZE_MISMATCH = "REPORT_FREEZE_MISMATCH"
 REPORT_SCORES_INVALID = "REPORT_SCORES_INVALID"
+REPORT_RANKING_INVALID = "REPORT_RANKING_INVALID"
 
 _MESSAGES = {
     REPORT_HASH_MISMATCH: "a hash of the run disagrees with the inputs or the pool it is reported with",
@@ -173,6 +187,7 @@ _MESSAGES = {
     REPORT_FREEZE_INVALID: "the freeze binding of the report is malformed",
     REPORT_FREEZE_MISMATCH: "the freeze binding disagrees with the dev-dataset or manifest hash of the run",
     REPORT_SCORES_INVALID: "the score diagnostics of the report are missing, malformed or disagree with the run",
+    REPORT_RANKING_INVALID: "the ranking determinism section is missing, malformed or does not match the rankings",
 }
 
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -393,6 +408,70 @@ def _scores_ok(document: Mapping[str, Any]) -> bool:
     )
 
 
+def ranking_determinism_section(ranking_sha256: str) -> dict[str, Any]:
+    """The ``ranking_determinism`` section for a run whose two passes gave this D7 ranking hash.
+
+    A report only exists when the two passes were identical, so ``rankings_identical_across_passes`` is always
+    ``True``; a failed comparison is never representable.
+    """
+    if type(ranking_sha256) is not str or SHA256_HEX_PATTERN.fullmatch(ranking_sha256) is None:
+        raise ValueError("ranking_sha256 must be 64 lowercase hexadecimal characters")
+    return {
+        "format": DETERMINISM_FORMAT, "passes": DETERMINISM_PASSES, "ranking_sha256": ranking_sha256,
+        "rankings_identical_across_passes": True,
+    }
+
+
+_CHUNK_KEYS = frozenset({"corpus_key", "start", "end", "text_sha256"})
+
+
+def _serialized_rows(dense: object) -> list[tuple[str, list[RankedChunk]]] | None:
+    """``(question_id, ranked chunks)`` rebuilt from ``dense.questions``, or None if any entry is malformed."""
+    if not isinstance(dense, list):
+        return None
+    rows = []
+    for question in dense:
+        ranking = question.get("ranking") if isinstance(question, Mapping) else None
+        if not isinstance(ranking, list) or any(
+            not isinstance(chunk, Mapping) or set(chunk) != _CHUNK_KEYS for chunk in ranking
+        ):
+            return None
+        try:
+            chunks = [RankedChunk(c["corpus_key"], c["start"], c["end"], c["text_sha256"]) for c in ranking]
+        except (TypeError, ValueError):
+            return None
+        rows.append((question.get("question_id"), chunks))
+    return rows
+
+
+def _determinism_ok(document: Mapping[str, Any]) -> bool:
+    """The ``ranking_determinism`` section: an exact closed schema, and a ranking hash that RECOMPUTES.
+
+    The digest is rebuilt with ``ranking_hash.ranking_digest`` from the document's own dense rankings and its
+    candidate-pool size, so a supplied hash is never trusted for being well formed.
+    """
+    section = document.get("ranking_determinism")
+    if not isinstance(section, Mapping) or set(section) != _DETERMINISM_KEYS:
+        return False
+    digest = section["ranking_sha256"]
+    if (
+        section["format"] != DETERMINISM_FORMAT
+        or type(section["passes"]) is not int
+        or section["passes"] != DETERMINISM_PASSES
+        or type(digest) is not str
+        or SHA256_HEX_PATTERN.fullmatch(digest) is None
+        or section["rankings_identical_across_passes"] is not True
+    ):
+        return False
+    rows = _serialized_rows(document["dense"]["questions"])
+    if rows is None:
+        return False
+    try:
+        return rh.ranking_digest(rh.expected_length(document["inputs"]["candidate_pool"]["size"]), rows) == digest
+    except (EvaluationDataError, TypeError, ValueError, KeyError):
+        return False
+
+
 def _baseline_extras_ok(document: Mapping[str, Any]) -> bool:
     """The baseline-only keys of a loaded document: the exact scope, a well-formed freeze binding, the
     binding's two run hashes equal to the document's own input hashes, and valid score diagnostics."""
@@ -405,6 +484,7 @@ def _baseline_extras_ok(document: Mapping[str, Any]) -> bool:
             section["dev_label_binding_sha256"] == inputs["dev_dataset"]["sha256"]
             and section["canonical_manifest_sha256"] == inputs["manifest"]["sha256"]
             and _scores_ok(document)
+            and _determinism_ok(document)
         )
     except (KeyError, TypeError):
         return False
@@ -417,14 +497,19 @@ def _contract(document: Mapping[str, Any]) -> tuple[str, str] | None:
 
 def _contract_ok(document: object) -> bool:
     """The complete contract of a loaded report: kind, format version, label and ``is_v1_baseline``; for a
-    ``retrieval_baseline`` also the exact scope and the freeze binding (see ``_baseline_extras_ok``)."""
+    ``retrieval_baseline`` also the exact scope, the freeze binding, the score diagnostics and the ranking
+    determinism (see ``_baseline_extras_ok``); a pilot must not carry a ``ranking_determinism`` section."""
     contract = _contract(document) if isinstance(document, Mapping) else None
     return (
         contract is not None
         and document.get("report_format_version") == contract[0]
         and document.get("label") == contract[1]
         and document.get("is_v1_baseline") is False
-        and (document["kind"] != BASELINE_KIND or _baseline_extras_ok(document))
+        and (
+            _baseline_extras_ok(document)
+            if document["kind"] == BASELINE_KIND
+            else "ranking_determinism" not in document
+        )
     )
 
 
@@ -511,21 +596,29 @@ def build_report(
     run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata,
     *, kind: str = REPORT_KIND, freeze: FreezeBinding | None = None,
     score_diagnostics: Mapping[str, Any] | None = None,
+    ranking_determinism: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The JSON-ready report document (plain dicts, lists, strings, ints and finite floats).
 
     ``kind`` is ``validity_pilot`` (default; ``freeze`` and ``score_diagnostics`` must then be ``None``) or
     ``retrieval_baseline`` (``freeze`` must be the verified ``FreezeBinding`` of the frozen dev inputs and
-    ``score_diagnostics`` the section built by ``score_diagnostics.build_score_diagnostics`` for this run).
+    ``score_diagnostics`` the section built by ``score_diagnostics.build_score_diagnostics`` for this run and
+    ``ranking_determinism`` the section of ``ranking_determinism_section`` for this run's D7 ranking hash).
     """
     if type(kind) is not str or kind not in _CONTRACTS:
         raise ValueError("unknown report kind")
-    if kind == REPORT_KIND and (freeze is not None or score_diagnostics is not None):
-        raise ValueError("a validity_pilot report takes no freeze binding and no score diagnostics")
+    if kind == REPORT_KIND and (
+        freeze is not None or score_diagnostics is not None or ranking_determinism is not None
+    ):
+        raise ValueError(
+            "a validity_pilot report takes no freeze binding, no score diagnostics and no ranking determinism"
+        )
     if kind == BASELINE_KIND and not isinstance(freeze, FreezeBinding):
         raise TypeError("a retrieval_baseline report requires a FreezeBinding")
     if kind == BASELINE_KIND and not isinstance(score_diagnostics, Mapping):
         raise TypeError("a retrieval_baseline report requires the score diagnostics section")
+    if kind == BASELINE_KIND and not isinstance(ranking_determinism, Mapping):
+        raise TypeError("a retrieval_baseline report requires the ranking determinism section")
     _verify(run, inputs, pool, metadata)
     freeze_section = _freeze_document(freeze, run) if kind == BASELINE_KIND else None
     if kind == BASELINE_KIND and not sd.section_ok(
@@ -536,6 +629,13 @@ def build_report(
         answerable_ranking_lengths=[len(item.dense) for item in run.questions],
     ):
         raise _fail(REPORT_SCORES_INVALID, "score_diagnostics")
+    if kind == BASELINE_KIND:
+        try:
+            expected = ranking_determinism_section(rh.ranking_sha256(run, inputs, pool))
+        except (EvaluationDataError, ValueError):
+            raise _fail(REPORT_RANKING_INVALID, "ranking_determinism") from None
+        if not _same_json(ranking_determinism, expected):
+            raise _fail(REPORT_RANKING_INVALID, "ranking_determinism")
     structure = {q.question_id: derive_structure(q) for q in inputs.answerable}
     ids = run.questions[0].dense_scores.metric_ids if run.questions else ()
 
@@ -639,6 +739,7 @@ def build_report(
         document["scope"] = dict(BASELINE_SCOPE)
         document["freeze_binding"] = freeze_section
         document["score_diagnostics"] = score_diagnostics
+        document["ranking_determinism"] = dict(ranking_determinism)
     plain = _plain(document)
     _check_no_leak(plain, inputs)
     return plain
@@ -666,9 +767,11 @@ def render_report(
     run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata,
     *, kind: str = REPORT_KIND, freeze: FreezeBinding | None = None,
     score_diagnostics: Mapping[str, Any] | None = None,
+    ranking_determinism: Mapping[str, Any] | None = None,
 ) -> SerializedReport:
     document = build_report(
         run, inputs, pool, metadata, kind=kind, freeze=freeze, score_diagnostics=score_diagnostics,
+        ranking_determinism=ranking_determinism,
     )
     data = serialize_report(document)
     return SerializedReport(document, data, hashlib.sha256(data).hexdigest())
@@ -678,7 +781,8 @@ def load_report(data: bytes) -> dict[str, Any]:
     """Parse a serialised report and check its kind, version and label (no other validation).
 
     A ``retrieval_baseline`` document is also checked for its exact ``scope`` and a well-formed
-    ``freeze_binding`` that agrees with the document's own input hashes, and valid ``score_diagnostics``.
+    ``freeze_binding`` that agrees with the document's own input hashes, valid ``score_diagnostics`` and a
+    ``ranking_determinism`` section whose hash recomputes from the document's dense rankings.
     """
     if type(data) is not bytes:
         raise TypeError("data must be bytes")
