@@ -440,6 +440,12 @@ def test_git_state_does_not_depend_on_the_working_directory(tmp_path: Path, git_
     assert bc.tracked_git_state(dirty)[1] == bc.GIT_UNSTAGED
 
 
+def test_the_help_description_describes_the_two_pass_run_and_is_not_a_stale_checkpoint_note() -> None:
+    description = bc.build_parser().description or ""
+    assert "two complete dense passes" in description.lower() and "no report is written" in description
+    assert "preflight gates exist" not in description and "this checkpoint" not in description
+
+
 def test_every_git_command_names_the_repository_and_never_lists_untracked_paths(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     recorded: list[tuple[list[str], dict]] = []

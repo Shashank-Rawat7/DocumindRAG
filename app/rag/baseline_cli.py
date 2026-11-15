@@ -109,7 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="e24_run_baseline.py",
         description="Run the retrieval-only dense baseline on the dev split (E2.4). Read-only database, report "
-                    "outside the repository. Only the preflight gates exist in this checkpoint.",
+                    "outside the repository. Two complete dense passes must give identical rankings, "
+                    "or no report is written.",
         allow_abbrev=False,
     )
     parser.add_argument("--database", required=True, type=_non_blank,
@@ -664,5 +665,5 @@ def _preflight(
                      head_commit=commit)
 
 
-if __name__ == "__main__":  # pragma: no cover - the wrapper script comes in a later checkpoint
+if __name__ == "__main__":  # pragma: no cover - direct module run (operator entry: scripts/e24_run_baseline.py)
     raise SystemExit(main())
