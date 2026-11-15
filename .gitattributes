@@ -1,2 +1,5 @@
 eval/corpus/** text eol=lf
 eval/corpus/**/*.pdf binary
+eval/dataset/dev.jsonl text eol=lf
+eval/dataset/dataset.json text eol=lf
+eval/dataset/freeze_record.json text eol=lf
