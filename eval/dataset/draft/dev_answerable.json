@@ -1,0 +1,565 @@
+[
+ {
+  "question_id": "d-pgc-01",
+  "split": "dev",
+  "question": "How does the FOR NO KEY UPDATE row-level lock mode differ from FOR UPDATE?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "It is weaker: it does not block SELECT FOR KEY SHARE commands that try to lock the same rows.",
+  "difficulty": "direct",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "FOR NO KEY UPDATE\nBehaves similarly to FOR UPDATE, except that the lock acquired is weaker: this lock will not block\nSELECT FOR KEY SHARE commands that attempt to acquire a lock on the same rows."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgc-02",
+  "split": "dev",
+  "question": "PostgreSQL में एक समय में कितनी rows लॉक की जा सकती हैं, और row लॉक करने का क्या अतिरिक्त प्रभाव हो सकता है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "There is no limit on the number of rows locked at one time, but locking a row might cause a disk write (SELECT FOR UPDATE marks the selected rows as locked).",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "PostgreSQL doesn't remember any information about modified rows in memory, so there is no limit on\nthe number of rows locked at one time. However, locking a row might cause a disk write, e.g., SELECT\nFOR UPDATE modifies selected rows to mark them locked, and so will result in disk writes."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgc-03",
+  "split": "dev",
+  "question": "Which DDL commands are not MVCC-safe in PostgreSQL?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "TRUNCATE and the table-rewriting forms of ALTER TABLE.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "Some DDL commands, currently only TRUNCATE and the table-rewriting forms of ALTER TABLE, are\nnot MVCC-safe."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgc-04",
+  "split": "dev",
+  "question": "What is the strictest transaction isolation level supported in PostgreSQL hot standby mode?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Repeatable Read; Serializable is not yet supported on hot standby replication targets.",
+  "difficulty": "paraphrase",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "Support for the Serializable transaction isolation level has not yet been added to hot standby replication\ntargets (described in Section 26.4). The strictest isolation level currently supported in hot standby mode is\nRepeatable Read."
+     }
+    ]
+   }
+  ],
+  "notes": "Close distractor: the 13.4.1 warning that Serializable protection does not extend to hot standby or logical replicas (does not name the strictest level)."
+ },
+ {
+  "question_id": "d-pgc-05",
+  "split": "dev",
+  "question": "PostgreSQL में यह सुनिश्चित करने के लिए कि कोई concurrent ट्रांज़ैक्शन चुनी गई row को अपडेट या डिलीट न करे, SELECT FOR UPDATE के अलावा क्या करना पड़ता है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "You must actually update the row, even if no values need to be changed; SELECT FOR UPDATE only blocks other transactions temporarily until the lock holder commits or rolls back.",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "Also of note to those converting from other environments is the fact that SELECT FOR UPDATE does not\nensure that a concurrent transaction will not update or delete a selected row. To do that in PostgreSQL you\nmust actually update the row, even if no values need to be changed."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgc-06",
+  "split": "dev",
+  "question": "What happens to a Repeatable Read transaction in PostgreSQL that tries to update a row that a concurrent transaction has already updated and committed?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "It is rolled back with the error 'could not serialize access due to concurrent update'.",
+  "difficulty": "paraphrase",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "But if the first updater commits (and actually updated or deleted\nthe row, not just locked it) then the repeatable read transaction will be rolled back with the message"
+     }
+    ]
+   },
+   {
+    "unit_id": "u2",
+    "spans": [
+     {
+      "corpus_key": "pg18-concurrency",
+      "quote": "ERROR:  could not serialize access due to concurrent update"
+     }
+    ]
+   }
+  ],
+  "notes": "The evidence is split into two units around a PDF page break ('546 / Concurrency Control'); the page-break noise is excluded from both spans. Close distractor: the Read Committed passage on a second updater."
+ },
+ {
+  "question_id": "d-pgi-01",
+  "split": "dev",
+  "question": "For a multicolumn B-tree index, which query constraints are always used to limit the portion of the index that is scanned?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Equality constraints on leading columns, plus any inequality constraints on the first column that does not have an equality constraint.",
+  "difficulty": "direct",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "The exact rule is that equality constraints on leading columns, plus any inequality constraints on the first\ncolumn that does not have an equality constraint, will always be used to limit the portion of the index that\nis scanned."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgi-02",
+  "split": "dev",
+  "question": "PostgreSQL में multicolumn GIN इंडेक्स का इस्तेमाल करते समय, क्या सर्च की performance इस बात से प्रभावित होती है कि query में इंडेक्स के कौन-से कॉलम इस्तेमाल किए गए हैं?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "It does not depend on it: unlike B-tree or GiST, GIN search effectiveness is the same regardless of which index columns the query conditions use.",
+  "difficulty": "paraphrase",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "A multicolumn GIN index can be used with query conditions that involve any subset of the index's columns.\nUnlike B-tree or GiST, index search effectiveness is the same regardless of which index column(s) the\nquery conditions use."
+     }
+    ]
+   }
+  ],
+  "notes": "Close distractors: the multicolumn B-tree, GiST and BRIN paragraphs of the same section."
+ },
+ {
+  "question_id": "d-pgi-03",
+  "split": "dev",
+  "question": "What do BRIN indexes store, and for which kind of columns are they most effective?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "They store summaries about the values in consecutive physical block ranges of a table, and are most effective for columns whose values are well-correlated with the physical order of the table rows.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "BRIN indexes (a shorthand for Block Range INdexes) store summaries about the values stored in\nconsecutive physical block ranges of a table. Thus, they are most effective for columns whose values are\nwell-correlated with the physical order of the table rows."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgi-04",
+  "split": "dev",
+  "question": "PostgreSQL में partial index बनाते समय, सामान्य (common) मानों को इंडेक्स से बाहर रखने का क्या फायदा है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "To reduce the index size, speed up queries that do use the index, and speed up many table update operations, because common values are not indexed.",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "One major reason for using a partial index is to avoid indexing common values. Since a query searching\nfor a common value (one that accounts for more than a few percent of all the table rows) will not use\nthe index anyway, there is no point in keeping those rows in the index at all. This reduces the size of the\nindex, which will speed up those queries that do use the index. It will also speed up many table update\noperations because the index does not need to be updated in all cases."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgi-05",
+  "split": "dev",
+  "question": "How many collations can a single PostgreSQL index column support, and what is needed if queries use several collations?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Only one collation per index column; multiple indexes may be needed if several collations are of interest.",
+  "difficulty": "direct",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "An index can support only one collation per index column. If multiple collations are of interest, multiple\nindexes may be needed."
+     }
+    ]
+   }
+  ],
+  "notes": "Close distractor: Section 11.10 on operator classes for non-C locales (a different problem: pattern matching)."
+ },
+ {
+  "question_id": "d-pgi-06",
+  "split": "dev",
+  "question": "What should be run before examining index usage for an application's queries, and what does it provide?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Run ANALYZE first; it collects statistics about the distribution of the values in the table.",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "Always run ANALYZE first. This command collects statistics about the distribution of the values in the\ntable."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-pgi-07",
+  "split": "dev",
+  "question": "In what order does a PostgreSQL B-tree index store its entries by default, with respect to sort direction and nulls?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "In ascending order with nulls last (the table TID is a tiebreaker among otherwise equal entries).",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "pg18-indexes",
+      "quote": "By default, B-tree indexes store their entries in ascending order with nulls last (table TID is treated as a\ntiebreaker column among otherwise equal entries)."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-fap-01",
+  "split": "dev",
+  "question": "Which Docker command line option enables running a container on startup and restarting it on failures?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "The `--restart` option.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "fastapi-deployment-docker-en",
+      "quote": "In most (or all) cases, there's a simple option to enable running the container on startup and enabling restarts on failures. For example, in Docker, it's the command line option `--restart`."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-fap-02",
+  "split": "dev",
+  "question": "Docker Compose का इस्तेमाल करके जब किसी ऐप को एक ही सर्वर पर चलाना हो, तो किन परिस्थितियों में एक ही कंटेनर के अंदर Uvicorn के कई worker चलाना सही रहता है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "When deploying to a single server (not a cluster) with Docker Compose, where there is no easy way to manage container replication while preserving the shared network and load balancing; then a single container with a process manager starting several worker processes can make sense.",
+  "difficulty": "paraphrase",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "fastapi-deployment-docker-en",
+      "quote": "You could be deploying to a **single server** (not a cluster) with **Docker Compose**, so you wouldn't have an easy way to manage replication of containers (with Docker Compose) while preserving the shared network and **load balancing**.\n\nThen you could want to have **a single container** with a **process manager** starting **several worker processes** inside."
+     }
+    ]
+   }
+  ],
+  "notes": "Close distractor: the cluster-level 'one process per container' passage (used in test)."
+ },
+ {
+  "question_id": "d-fap-03",
+  "split": "dev",
+  "question": "What can be said about the memory consumed by each container when a single process runs per container?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Each container has a more or less well-defined, stable and limited amount of memory consumption.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "fastapi-deployment-docker-en",
+      "quote": "If you run **a single process per container** you will have a more or less well-defined, stable, and limited amount of memory consumed by each of those containers (more than one if they are replicated)."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-fap-04",
+  "split": "dev",
+  "question": "अगर आप अपने Python प्रोजेक्ट में dependencies install और manage करने के लिए `uv` का इस्तेमाल कर रहे हैं, तो Docker में प्रोजेक्ट को सेटअप करने के लिए किस गाइड को देखना चाहिए?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "The uv Docker guide (https://docs.astral.sh/uv/guides/integration/docker/).",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "fastapi-deployment-docker-en",
+      "quote": "If you are using [uv](https://github.com/astral-sh/uv) to install and manage your project, you can follow their [uv Docker guide](https://docs.astral.sh/uv/guides/integration/docker/)."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-dkr-01",
+  "split": "dev",
+  "question": "For what task does the guide say the ADD instruction is best suited, and why is it better than fetching files manually with wget and tar?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "ADD is best for downloading a remote artifact as part of the build; it is better than wget and tar because it ensures a more precise build cache.",
+  "difficulty": "direct",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "docker-build-best-practices",
+      "quote": "The `ADD` instruction is best for when you need to download a remote artifact\nas part of your build. `ADD` is better than manually adding files using\nsomething like `wget` and `tar`, because it ensures a more precise build cache."
+     }
+    ]
+   }
+  ],
+  "notes": "Close distractor: the COPY and bind-mount paragraphs just before it."
+ },
+ {
+  "question_id": "d-dkr-02",
+  "split": "dev",
+  "question": "Dockerfile में sudo के बजाय किस टूल पर विचार करने का सुझाव दिया गया है जब daemon को root के रूप में शुरू करके non-root के रूप में चलाना हो?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "gosu; sudo should be avoided because of its unpredictable TTY and signal-forwarding behaviour.",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "docker-build-best-practices",
+      "quote": "Avoid installing or using `sudo` as it has unpredictable TTY and\nsignal-forwarding behavior that can cause problems. If you absolutely need\nfunctionality similar to `sudo`, such as initializing the daemon as `root` but\nrunning it as non-`root`, consider using [“gosu”](https://github.com/tianon/gosu)."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-dkr-03",
+  "split": "dev",
+  "question": "What kind of paths should the WORKDIR instruction use, and what should it be used instead of?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Absolute paths; WORKDIR should be used instead of proliferating instructions like `RUN cd … && do-something`.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "docker-build-best-practices",
+      "quote": "For clarity and reliability, you should always use absolute paths for your\n`WORKDIR`. Also, you should use `WORKDIR` instead of proliferating instructions\nlike `RUN cd … && do-something`, which are hard to read, troubleshoot, and\nmaintain."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-dkr-04",
+  "split": "dev",
+  "question": "ONBUILD का उपयोग करके बनाई गई इमेज के बारे में टैग को लेकर क्या सुझाव दिया गया है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "Images built with ONBUILD should get a separate tag, for example `ruby:1.9-onbuild` or `ruby:2.0-onbuild`.",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "docker-build-best-practices",
+      "quote": "Images built with `ONBUILD` should get a separate tag. For example,\n`ruby:1.9-onbuild` or `ruby:2.0-onbuild`."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-asy-01",
+  "split": "dev",
+  "question": "In which thread must the asyncio event loop run in order to handle signals?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "The main thread.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "python314-asyncio-dev",
+      "quote": "To handle signals the event loop must be\nrun in the main thread."
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-asy-02",
+  "split": "dev",
+  "question": "asyncio में किसी अलग process का कोड चलाने के लिए loop की कौन-सी विधि किस executor के साथ इस्तेमाल की जा सकती है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "The `loop.run_in_executor` method with a `concurrent.futures.ProcessPoolExecutor`.",
+  "difficulty": "paraphrase",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "python314-asyncio-dev",
+      "quote": "Lastly, the\naforementioned :meth:`loop.run_in_executor` method can also be used\nwith a :class:`concurrent.futures.ProcessPoolExecutor` to execute\ncode in a different process."
+     }
+    ]
+   }
+  ],
+  "notes": "Close distractor: the ThreadPoolExecutor / InterpreterPoolExecutor sentence earlier in the same section."
+ },
+ {
+  "question_id": "d-asy-03",
+  "split": "dev",
+  "question": "What is the default log level of the asyncio logger?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "logging.INFO.",
+  "difficulty": "direct",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "python314-asyncio-dev",
+      "quote": "The default log level is :py:const:`logging.INFO`, which can be easily\nadjusted"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "question_id": "d-cmp-01",
+  "split": "dev",
+  "question": "In the Compose startup-order example, how often is the db service's healthcheck retried, and how many times?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "expected_answer": "Every 10 seconds, up to 5 times.",
+  "difficulty": "direct",
+  "close_distractor": true,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "docker-compose-startup-order",
+      "quote": "The healthcheck for the `db` service uses the `pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}` command to check if the PostgreSQL database is ready. The service is retried every 10 seconds, up to 5 times."
+     }
+    ]
+   }
+  ],
+  "notes": "Evidence is the prose sentence stating the retry interval and count for the db healthcheck (the YAML healthcheck block states the same values but does not name the service on its own, so it is not used as an alternative)."
+ },
+ {
+  "question_id": "d-cmp-02",
+  "split": "dev",
+  "question": "docker compose up से एप्लिकेशन और डेटाबेस सर्विस साथ शुरू करने पर विफलता की संभावना क्यों रहती है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "expected_answer": "Because the application service might start before the database service and find no database able to handle its SQL statements.",
+  "difficulty": "paraphrase",
+  "close_distractor": false,
+  "units": [
+   {
+    "unit_id": "u1",
+    "spans": [
+     {
+      "corpus_key": "docker-compose-startup-order",
+      "quote": "For example, if your application needs to access a database and both services are started with `docker compose up`, there is a chance this will fail since the application service might start before the database service and won't find a database able to handle its SQL statements."
+     }
+    ]
+   }
+  ]
+ }
+]

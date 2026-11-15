@@ -296,11 +296,16 @@ def test_inapplicable_content_is_not_validated():
     "field",
     [
         pytest.param("unanswerable_type", id="unanswerable-type"),
-        pytest.param("semantic_review", id="semantic-review"),
     ],
 )
 def test_an_unanswerable_question_must_have_its_fields(field):
     assert check(unanswerable(**{field: None})) == [("Q_FIELD_MISSING", f"question.{field}")]
+
+
+def test_semantic_review_is_optional_and_never_an_ai_review_field():
+    """E1.6.2.2: a record with no human second reader is valid; an AI review is an audit event, not this field."""
+    assert check(unanswerable(semantic_review=None)) == []
+    assert check(unanswerable(semantic_review=review())) == []
 
 
 @pytest.mark.parametrize(
@@ -845,7 +850,6 @@ def test_the_full_issue_order_common_fields_then_hindi_then_kind_fields():
         ("Q_HINDI_REVIEW_REQUIRED", "question.hindi_reviewed"),
         ("Q_HINDI_REVIEWER_REQUIRED", "question.hindi_reviewer"),
         ("Q_ENUM", "question.unanswerable_type"),
-        ("Q_FIELD_MISSING", "question.semantic_review"),
     ]
 
 

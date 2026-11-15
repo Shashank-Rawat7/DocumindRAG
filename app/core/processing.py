@@ -1,47 +1,11 @@
 import logging
-from pathlib import Path
-
-from docx import Document as DocxDocument
-from pypdf import PdfReader
 
 from app.core import storage
 from app.core.database import SessionLocal
+from app.core.text_extraction import ExtractionError, extract_text
 from app.models.document import Document
 
 logger = logging.getLogger("documind")
-
-
-class ExtractionError(Exception):
-    """A failure whose message is safe to show to the user."""
-
-
-def extract_text(path: Path) -> str:
-    if not path.is_file():
-        raise ExtractionError("Stored file not found")
-
-    ext = path.suffix.lower()
-
-    if ext in (".txt", ".md"):
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    elif ext == ".pdf":
-        reader = PdfReader(path)
-        text = "\n".join((page.extract_text() or "") for page in reader.pages)
-    elif ext == ".docx":
-        doc = DocxDocument(str(path))
-        parts = [p.text for p in doc.paragraphs]
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells]
-                parts.append(" | ".join(c for c in cells if c))
-        text = "\n".join(parts)
-    else:
-        raise ExtractionError("Unsupported file type")
-
-    text = text.replace("\x00", "")
-    if not text.strip():
-        raise ExtractionError("No extractable text found (the file may be empty or scanned)")
-
-    return text
 
 
 def _mark_failed(db, document_id: int, reason: str) -> None:

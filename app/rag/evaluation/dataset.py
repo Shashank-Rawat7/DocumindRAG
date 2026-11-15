@@ -331,7 +331,9 @@ def _check_kind_fields(c: _Collector, q: Question, answerable: bool, location: s
             if value is not None:
                 c.add(Q_INAPPLICABLE_FIELD, f"{location}.{field}")
         elif value is None:
-            if field != "retrieval_assistance":  # retrieval_assistance is optional here
+            # Optional here: ``retrieval_assistance``, and ``semantic_review``, which holds only a HUMAN second reader.
+            # An AI review is recorded as an ``ai_semantic_review`` audit event, never in this field.
+            if field not in ("retrieval_assistance", "semantic_review"):
                 c.add(Q_FIELD_MISSING, f"{location}.{field}")
         else:
             check(value, f"{location}.{field}")

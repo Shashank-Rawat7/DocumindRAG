@@ -1,0 +1,127 @@
+{
+  "record_format": "eval-freeze-record-v1",
+  "dataset_version": "eval-dataset-v1.0.0",
+  "frozen_on": "2026-11-14",
+  "status": "frozen_dataset_not_baseline",
+  "anchoring": "Hash-anchored dataset freeze, not a clean-Git or commit-anchored freeze. The dataset is identified by the file hashes below, not by a clean commit.",
+  "files": {
+    "eval/dataset/dataset.json": "3f23c286be3f4010d9595b971ebc1c9ae05efc882d6ec4406014c45a356436fa",
+    "eval/dataset/dev.jsonl": "09169e4f0bef3520fcbee1643af7d181681293201b76064f991744504a8795c0",
+    "eval/dataset/test.jsonl": "ca91147de690076c833494184f44fee533f4fff4a0dd76488f91fbc246657ae5",
+    "eval/dataset/audit.jsonl": "1ff203c039239104c651a41b5cc337ccccf84b6340cc2f446c9266b0692f0ff4",
+    "eval/dataset/guidelines.md": "83dacfd4dde350d6b50e75124c176f963c335c2c09557102e012d76a00f85dfa",
+    "eval/dataset/draft/README.md": "f977beb9fc7f9c17c8f27d70ca513d5137ae9e06ccaeb16950767f414353399c",
+    "eval/corpus/manifest.json": "1902c8cc1491cb3239617edc88fb70c401964bf46bb3ce4e3b9ee6edc88e6422"
+  },
+  "corpus": {
+    "corpus_version": "eval-corpus-v1",
+    "canonical_manifest_hash": "7f6d7473e5b632a4ba09f980c671f6970597e0b836e9a5a27875f360234c9cc9"
+  },
+  "label_binding_hashes": {
+    "dev": "860078e2fdb8bfabcfaddc4f184eb6af941d52bfb004f8a61d8a7f6b8416951c",
+    "test": "216979a120db485d9716cef5116c47f375fbda3816ea6296297cf553392478f4"
+  },
+  "counts": {
+    "dev": {
+      "total": 36,
+      "answerable": 26,
+      "unanswerable": 10
+    },
+    "test": {
+      "total": 50,
+      "answerable": 50,
+      "unanswerable": 0
+    },
+    "total": {
+      "total": 86,
+      "answerable": 76,
+      "unanswerable": 10
+    },
+    "language": {
+      "english": 53,
+      "hindi": 33
+    }
+  },
+  "review_provenance": {
+    "current_human_evidence_reviews": {
+      "questions_with_current_review": 86,
+      "total_questions": 86
+    },
+    "ai_only_semantic_reviews": {
+      "questions": [
+        "du-01",
+        "du-02",
+        "du-03",
+        "du-04",
+        "du-05",
+        "du-06",
+        "du-07",
+        "du-08",
+        "du-09",
+        "du-10"
+      ],
+      "informational": true,
+      "blocking": false
+    },
+    "hindi_review": "performed by a single reviewer",
+    "author_type": "llm_assisted"
+  },
+  "audit": {
+    "auditor": "Shark",
+    "date": "2026-11-14",
+    "kind": "non_independent_second_pass",
+    "blind": false,
+    "independent": false,
+    "total_audit_events": 159,
+    "audit_results": 26,
+    "machine_agreements": 21,
+    "machine_disagreements": 5,
+    "machine_outcomes_note": "The five machine outcomes remain disagreements in the log. Not all 26 machine outcomes agreed.",
+    "disagreements_human_adjudicated": true,
+    "disagreement_audit_ids": [
+      "A06",
+      "A07",
+      "A11",
+      "A13",
+      "A15"
+    ],
+    "disagreements_with_non_empty_resolution": 5,
+    "canonical_labels_changed_by_audit": false,
+    "original_events_preserved": {
+      "count": 133,
+      "sha256": "d2f78cb27b70714f8cfbe4cd0d677c99ec13b3960d972f73ae57a719ce2393a3",
+      "note": "Recomputed over the first 133 lines of audit.jsonl (full 64-character value)."
+    },
+    "specification": {
+      "file": "audit_spec_v2.json",
+      "sha256": "c46a61d7c1ed69f3d726433bfcb0d607a554b9a20b6fe3bb99e8cbacdef8aae4"
+    },
+    "ai_assistance_disclosure": "Claude, an AI model, mechanically transformed the auditor's completed worksheet into the JSON audit specification, assisted with mechanical checks (format, exact-quote matching, read-only offset comparison) and drafted the wording of the five resolution texts. It did not perform evidence discovery, judge whether any finding was correct, or make the human adjudication decisions."
+  },
+  "pilot_reference": {
+    "label": "Validity pilot — not the V1 baseline",
+    "report_sha256": "4a7418cd524a5c19f84a127803a8654da339e69380a59cd84d5dd08a36c0200f",
+    "working_tree_clean": false,
+    "test_split_read": false,
+    "dev_label_binding_hash_still_matches": true,
+    "official_v1_baseline": false
+  },
+  "git_state": {
+    "branch": "main",
+    "head": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+    "working_tree": "dirty",
+    "modified_tracked_files": 4,
+    "untracked_paths": 35,
+    "staged_files": 0,
+    "commit_or_push_during_freeze_work": false,
+    "note": "State observed immediately before this record was created. The dataset is anchored by its file hashes, not by a clean commit; the working tree was not cleaned."
+  },
+  "limitations": [
+    "Non-independent second-pass audit.",
+    "Single-reviewer Hindi review.",
+    "AI-only semantic review provenance for the 10 unanswerable questions (du-01 to du-10).",
+    "No official V1 baseline yet.",
+    "Dirty Git working tree.",
+    "The audit log does not independently encode worksheet status, confidence, notes or adjudicator identity."
+  ]
+}

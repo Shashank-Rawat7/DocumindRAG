@@ -97,7 +97,7 @@ class EvidenceUnit:
 
 @dataclass(frozen=True, slots=True)
 class SemanticReview:
-    """A second reader's review of an unanswerable question."""
+    """A human second reader's review of an unanswerable question. Optional on the question; never an AI review."""
 
     reviewer: str
     date: str

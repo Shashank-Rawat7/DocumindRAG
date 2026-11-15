@@ -1,0 +1,92 @@
+[
+ {
+  "question_id": "du-01",
+  "split": "dev",
+  "question": "What is the default value of the deadlock_timeout setting in PostgreSQL?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: 'deadlock_timeout' does not occur; the concurrency chapter describes deadlocks but not this setting."
+ },
+ {
+  "question_id": "du-02",
+  "split": "dev",
+  "question": "How do I set the number of Uvicorn workers in a FastAPI container through the WEB_CONCURRENCY environment variable?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: 'WEB_CONCURRENCY' does not occur; the FastAPI guide only describes the --workers command line option."
+ },
+ {
+  "question_id": "du-03",
+  "split": "dev",
+  "question": "Which Docker Compose setting controls how long Compose waits for a container to stop before killing it?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: no stop timeout or grace period setting ('stop_grace_period', 'kill') occurs in the Compose document or elsewhere."
+ },
+ {
+  "question_id": "du-04",
+  "split": "dev",
+  "question": "Which port does the FastAPI CLI listen on by default when the --port option is not given?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: no default port ('8000', 'default port') occurs; the guide always passes --port 80 explicitly."
+ },
+ {
+  "question_id": "du-05",
+  "split": "dev",
+  "question": "What is the default fillfactor of a PostgreSQL B-tree index?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "The selected `pg18-indexes` corpus document is limited to PostgreSQL 18.6 Chapter 11, pages 482–498. The B-tree fillfactor default is documented in the SQL CREATE INDEX reference elsewhere in the full manual, which is outside the selected corpus. The indexed corpus therefore does not support the answer."
+ },
+ {
+  "question_id": "du-06",
+  "split": "dev",
+  "question": "What is the recommended watering schedule for a tomato plant in summer?",
+  "query_language": "en",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "off_topic",
+  "notes": "Nothing in the corpus (software documentation) relates to gardening; keyword search for 'tomato', 'water' found nothing relevant."
+ },
+ {
+  "question_id": "du-07",
+  "split": "dev",
+  "question": "PostgreSQL में work_mem का डिफ़ॉल्ट मान क्या है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: 'work_mem' does not occur."
+ },
+ {
+  "question_id": "du-08",
+  "split": "dev",
+  "question": "asyncio में asyncio.timeout() का उपयोग करके किसी coroutine पर समय-सीमा कैसे लगाई जाती है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: 'asyncio.timeout' does not occur and the asyncio document has no word 'timeout'."
+ },
+ {
+  "question_id": "du-09",
+  "split": "dev",
+  "question": "Dockerfile में STOPSIGNAL निर्देश container को रोकने के लिए कौन-सा सिग्नल भेजता है?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "on_topic_not_covered",
+  "notes": "Keyword search of all six extracted corpus texts found no passage about this: 'STOPSIGNAL' does not occur in the Dockerfile best-practices document or elsewhere."
+ },
+ {
+  "question_id": "du-10",
+  "split": "dev",
+  "question": "बिरयानी बनाने के लिए चावल को कितनी देर भिगोना चाहिए?",
+  "query_language": "hi",
+  "author_type": "llm_assisted",
+  "unanswerable_type": "off_topic",
+  "notes": "Nothing in the corpus (software documentation) relates to cooking; keyword search for 'rice' found nothing."
+ }
+]

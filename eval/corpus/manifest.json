@@ -1,0 +1,117 @@
+{
+  "schema_version": "eval-manifest-v1",
+  "corpus_version": "eval-corpus-v1",
+  "stage": "ingested",
+  "documents": [
+    {
+      "corpus_key": "docker-build-best-practices",
+      "title": "Building best practices",
+      "publisher": "Docker, Inc.",
+      "source_url": "https://github.com/docker/docs/blob/61cbfdc1e72d0ac62dbac59ceaf7b94dcbe69c80/content/manuals/build/building/best-practices.md",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/docker/docs/blob/61cbfdc1e72d0ac62dbac59ceaf7b94dcbe69c80/LICENSE",
+      "format": "md",
+      "language": "en",
+      "source_file_sha256": "349577b488b7867670ac6264908303ba748bcc81682bdf33ef802d4e2e35ad6e",
+      "extracted_text_sha256": "349577b488b7867670ac6264908303ba748bcc81682bdf33ef802d4e2e35ad6e",
+      "extracted_text_length": 32969,
+      "extraction": {
+        "processing_ref": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+        "python": "3.12.4"
+      },
+      "redistributable": true
+    },
+    {
+      "corpus_key": "docker-compose-startup-order",
+      "title": "Control startup and shutdown order in Compose",
+      "publisher": "Docker, Inc.",
+      "source_url": "https://github.com/docker/docs/blob/61cbfdc1e72d0ac62dbac59ceaf7b94dcbe69c80/content/manuals/compose/how-tos/startup-order.md",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/docker/docs/blob/61cbfdc1e72d0ac62dbac59ceaf7b94dcbe69c80/LICENSE",
+      "format": "md",
+      "language": "en",
+      "source_file_sha256": "167fec8c700792a3ee72e45dd7232df8dc11c987853245a0af7afdbc2bfedcf7",
+      "extracted_text_sha256": "167fec8c700792a3ee72e45dd7232df8dc11c987853245a0af7afdbc2bfedcf7",
+      "extracted_text_length": 3118,
+      "extraction": {
+        "processing_ref": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+        "python": "3.12.4"
+      },
+      "redistributable": true
+    },
+    {
+      "corpus_key": "fastapi-deployment-docker-en",
+      "title": "FastAPI in Containers - Docker",
+      "publisher": "FastAPI project (Sebastián Ramírez)",
+      "source_url": "https://github.com/fastapi/fastapi/blob/5add7a458d629b07311d48261f696b5ac2bb9a5f/docs/en/docs/deployment/docker.md",
+      "license": "MIT",
+      "license_url": "https://github.com/fastapi/fastapi/blob/5add7a458d629b07311d48261f696b5ac2bb9a5f/LICENSE",
+      "format": "md",
+      "language": "en",
+      "source_file_sha256": "0337b98d51778755f59aa1b96ba319f0decc20136f3b3ff1b7547619a5c71100",
+      "extracted_text_sha256": "0337b98d51778755f59aa1b96ba319f0decc20136f3b3ff1b7547619a5c71100",
+      "extracted_text_length": 28836,
+      "extraction": {
+        "processing_ref": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+        "python": "3.12.4"
+      },
+      "redistributable": true
+    },
+    {
+      "corpus_key": "pg18-concurrency",
+      "title": "PostgreSQL 18.6 Documentation, Chapter 13. Concurrency Control (printed pages 543-558)",
+      "publisher": "PostgreSQL Global Development Group",
+      "source_url": "https://www.postgresql.org/files/documentation/pdf/18/postgresql-18-US.pdf",
+      "license": "PostgreSQL License",
+      "license_url": "https://github.com/postgres/postgres/blob/724edf9bde9d356724ad384a2e196edc3c9f80f7/doc/src/sgml/legal.sgml",
+      "format": "pdf",
+      "language": "en",
+      "source_file_sha256": "c049b6a747df41859b9ced0095ac4d32533fe8f970f8ba60756e88e4a584f465",
+      "extracted_text_sha256": "0537b77e9befa502962705456d7b44cb1ab715b6c47e93feea53d1e1d23fb31a",
+      "extracted_text_length": 53720,
+      "extraction": {
+        "processing_ref": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+        "python": "3.12.4",
+        "pypdf": "6.20.0"
+      },
+      "redistributable": true
+    },
+    {
+      "corpus_key": "pg18-indexes",
+      "title": "PostgreSQL 18.6 Documentation, Chapter 11. Indexes (printed pages 482-498)",
+      "publisher": "PostgreSQL Global Development Group",
+      "source_url": "https://www.postgresql.org/files/documentation/pdf/18/postgresql-18-US.pdf",
+      "license": "PostgreSQL License",
+      "license_url": "https://github.com/postgres/postgres/blob/724edf9bde9d356724ad384a2e196edc3c9f80f7/doc/src/sgml/legal.sgml",
+      "format": "pdf",
+      "language": "en",
+      "source_file_sha256": "c6d6e64faba4d8eed1fb65676a7c1b0d65db157c15e8f1e02b0d16d7bebc023c",
+      "extracted_text_sha256": "ffce2d380714203450c81ad6e93950ab10bf9fa4e75430ff803d1449deaafefc",
+      "extracted_text_length": 52365,
+      "extraction": {
+        "processing_ref": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+        "python": "3.12.4",
+        "pypdf": "6.20.0"
+      },
+      "redistributable": true
+    },
+    {
+      "corpus_key": "python314-asyncio-dev",
+      "title": "Developing with asyncio",
+      "publisher": "Python Software Foundation",
+      "source_url": "https://github.com/python/cpython/blob/ebf955df7a89ed0c7968f79faec1de49f61ed7cb/Doc/library/asyncio-dev.rst",
+      "license": "PSF-2.0 (documentation text); 0BSD (code examples)",
+      "license_url": "https://docs.python.org/3.14/license.html",
+      "format": "txt",
+      "language": "en",
+      "source_file_sha256": "41975dccd5de917d9da288998a94de9e07a2a66f575ecaba07bde948541617e3",
+      "extracted_text_sha256": "41975dccd5de917d9da288998a94de9e07a2a66f575ecaba07bde948541617e3",
+      "extracted_text_length": 7401,
+      "extraction": {
+        "processing_ref": "8cf1a47de5153713dc960c1fcf17c0be73d0776a",
+        "python": "3.12.4"
+      },
+      "redistributable": true
+    }
+  ]
+}
