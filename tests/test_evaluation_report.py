@@ -10,9 +10,11 @@ G  statistical suppression, truncation, warnings
 H  non-finite and unserialisable values, metadata validation
 I  code identity
 J  purity
+K  E2.2: the retrieval_baseline kind (pilot contract, code identity, freeze binding, loading, comparison)
 
 Run focused: pytest tests/test_evaluation_report.py --noconftest -p no:cacheprovider
 """
+import ast
 import copy
 import dataclasses
 import json
@@ -28,6 +30,7 @@ import test_evaluation_engine as fx  # the small hand-computed fixtures of E1.7.
 
 from app.rag.evaluation import baselines
 from app.rag.evaluation import engine as e
+from app.rag.evaluation import freeze_binding as fb
 from app.rag.evaluation import pool as p
 from app.rag.evaluation import report as rep
 from app.rag.evaluation import schema as s
@@ -560,3 +563,480 @@ def test_the_snapshot_record_is_optional_and_appears_in_the_document(bundle):
 def test_an_invalid_snapshot_record_is_refused(bundle, record):
     run, inputs, pool = bundle
     refused(rep.REPORT_METADATA_INVALID, rep.build_report, run, inputs, pool, meta(database_snapshots=record))
+
+
+# ---------- K: E2.2 the retrieval_baseline kind ----------
+
+# The pilot contract at the commit before E2.2, rendered with the FIXED test identity of this file. This pins the
+# document structure, fields and serialisation of the validity_pilot kind. It says nothing about REAL pilot runs:
+# their code identity is computed from the source files and changes whenever a listed module changes (see
+# test_the_real_pilot_code_identity_changes_by_design_while_the_document_contract_does_not).
+PILOT_GOLDEN_BYTES = 431541
+PILOT_GOLDEN_SHA256 = "17178c03a6f4e1e9def787398bcaf4390901bd23045c6299494fe58f19d00f6a"
+
+# CODE_IDENTITY_MODULES before E2.2.
+CODE_IDENTITY_BEFORE_E2_2 = (
+    "app.core.text_extraction", "app.rag.chunking", "app.rag.embedder", "app.rag.evaluation.aggregation",
+    "app.rag.evaluation.anchoring", "app.rag.evaluation.baselines", "app.rag.evaluation.dataset",
+    "app.rag.evaluation.engine", "app.rag.evaluation.intervals", "app.rag.evaluation.metrics",
+    "app.rag.evaluation.parsing", "app.rag.evaluation.passages", "app.rag.evaluation.pool",
+    "app.rag.evaluation.report", "app.rag.evaluation.runner_inputs", "app.rag.evaluation.schema",
+    "app.rag.evaluation.statistics", "app.rag.evaluation.structure", "app.rag.evaluation.validation",
+    "app.rag.indexing_service", "app.rag.retrieval", "app.rag.text_boundaries",
+)
+FREEZE_FIELDS = tuple(f.name for f in dataclasses.fields(fb.FreezeBinding))
+HASH_FIELDS = tuple(name for name in FREEZE_FIELDS if name.endswith("_sha256"))
+BASELINE_ONLY_KEYS = ("kind", "label", "report_format_version", "scope", "freeze_binding")
+
+
+def freeze_of(run, **over):
+    values = {
+        "dataset_version": "eval-dataset-v1.0.0", "frozen_on": "2026-11-14", "corpus_version": "eval-corpus-v1",
+        "record_sha256": "a" * 64, "dev_file_sha256": "b" * 64, "dataset_json_sha256": "c" * 64,
+        "manifest_file_sha256": "d" * 64, "dev_label_binding_sha256": run.dev_dataset_sha256,
+        "canonical_manifest_sha256": run.manifest_sha256,
+    }
+    values.update(over)
+    return fb.FreezeBinding(**values)
+
+
+@pytest.fixture(scope="module")
+def baseline(bundle):
+    return rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]))
+
+
+def tampered(document, change):
+    clone = copy.deepcopy(document)
+    change(clone)
+    return clone
+
+
+# --- K1: the pilot contract is unchanged ---
+
+def test_the_pilot_contract_golden_bytes_are_unchanged(rendered):
+    assert len(rendered.json_bytes) == PILOT_GOLDEN_BYTES
+    assert rendered.sha256 == PILOT_GOLDEN_SHA256
+
+
+def test_the_pilot_constants_and_label_are_unchanged():
+    assert rep.REPORT_KIND == "validity_pilot" and rep.REPORT_FORMAT_VERSION == "e1.7-report-1"
+    assert rep.REPORT_LABEL == "Validity pilot — not the V1 baseline"
+
+
+def test_a_pilot_report_has_none_of_the_baseline_keys_and_the_default_kind_is_the_pilot(bundle, rendered):
+    assert "scope" not in rendered.document and "freeze_binding" not in rendered.document
+    assert rep.render_report(*bundle, meta(), kind=rep.REPORT_KIND).json_bytes == rendered.json_bytes
+
+
+def test_a_pilot_report_takes_no_freeze_binding(bundle):
+    with pytest.raises(ValueError):
+        rep.build_report(*bundle, meta(), freeze=freeze_of(bundle[0]))
+    with pytest.raises(ValueError):
+        rep.build_report(*bundle, meta(), kind=rep.REPORT_KIND, freeze=freeze_of(bundle[0]))
+
+
+# --- K2: the code identity changes by design; the document contract does not ---
+
+def test_the_only_new_identity_module_is_the_freeze_binding_gate():
+    assert list(rep.CODE_IDENTITY_MODULES) == sorted(rep.CODE_IDENTITY_MODULES)
+    assert set(rep.CODE_IDENTITY_MODULES) - set(CODE_IDENTITY_BEFORE_E2_2) == {"app.rag.evaluation.freeze_binding"}
+    assert set(CODE_IDENTITY_BEFORE_E2_2) <= set(rep.CODE_IDENTITY_MODULES)
+    assert "app.rag.evaluation.freeze_binding" in dict(rep.compute_code_identity().files)
+
+
+def test_the_real_pilot_code_identity_changes_by_design_while_the_document_contract_does_not(bundle):
+    """The code identity hashes report.py itself and now freeze_binding.py, so a real pilot run's identity and
+    bytes change with this checkpoint. Only the code_identity section differs; every other part is the same."""
+    def stable(name):  # one hash per module NAME, the same in both identities
+        return rep.hash_source_bytes(name.encode("utf-8"))
+
+    added = "app.rag.evaluation.freeze_binding"
+    old = rep.combine_identity({m: stable(m) for m in CODE_IDENTITY_BEFORE_E2_2})
+    new = rep.combine_identity({m: stable(m) for m in rep.CODE_IDENTITY_MODULES})
+    old_files, new_files = dict(old.files), dict(new.files)
+    assert len(old_files) == 22 and len(new_files) == 23
+    assert set(new_files) - set(old_files) == {added} and set(old_files) <= set(new_files)
+    assert all(new_files[m] == old_files[m] for m in old_files)  # the 22 existing hashes are unchanged
+    assert new_files[added] == stable(added)
+    assert old.combined_sha256 != new.combined_sha256
+    before = rep.render_report(*bundle, meta(code_identity=old))
+    after = rep.render_report(*bundle, meta(code_identity=new))
+    assert before.json_bytes != after.json_bytes and before.sha256 != after.sha256
+    assert set(before.document) == set(after.document)
+    assert {k: v for k, v in before.document.items() if k != "code_identity"} == {
+        k: v for k, v in after.document.items() if k != "code_identity"}
+    assert len(after.document["code_identity"]["files"]) == len(before.document["code_identity"]["files"]) + 1
+    for rendered_report in (before, after):
+        assert rep.load_report(rendered_report.json_bytes) == rendered_report.document
+    rep.check_comparable(before.document, after.document)
+
+
+# --- K3: building a baseline ---
+
+def test_the_baseline_identifies_itself_as_retrieval_only_dense_dev_and_not_a_v1_baseline(baseline):
+    doc = baseline.document
+    assert doc["kind"] == "retrieval_baseline" and doc["is_v1_baseline"] is False
+    assert doc["report_format_version"] == "e2.2-report-1"
+    assert doc["label"] == "Retrieval-only dense V1 baseline (dev split) — not the full V1 RAG baseline"
+    assert doc["scope"] == {
+        "stage": "retrieval_only", "retrieval": "dense", "retrieval_version": "dense-v1", "split": "dev",
+        "generation_evaluated": False, "answer_quality_evaluated": False, "full_rag_baseline": False,
+    }
+    assert doc["inputs"]["dev_dataset"]["split"] == "dev" and doc["inputs"]["dev_dataset"]["test_split_read"] is False
+    assert doc["scope"] is not rep.BASELINE_SCOPE  # a copy: the constant cannot be changed through a document
+
+
+def test_the_baseline_holds_the_supplied_binding_and_the_same_sections_as_a_pilot(bundle, baseline, rendered):
+    assert baseline.document["freeze_binding"] == dataclasses.asdict(freeze_of(bundle[0]))
+    assert set(baseline.document["freeze_binding"]) == set(FREEZE_FIELDS) and len(FREEZE_FIELDS) == 9
+    assert set(baseline.document) == set(rendered.document) | {"scope", "freeze_binding"}
+    for key in set(rendered.document) - set(BASELINE_ONLY_KEYS):
+        assert baseline.document[key] == rendered.document[key], key
+    assert baseline.document["oracle"]["questions"] and baseline.document["random"]["questions"]  # reference rows
+
+
+def test_the_baseline_bytes_are_deterministic_canonical_and_round_trip(bundle, baseline):
+    again = rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]))
+    assert again.json_bytes == baseline.json_bytes and again.sha256 == baseline.sha256
+    assert rep.load_report(baseline.json_bytes) == baseline.document
+    assert rep.serialize_report(rep.load_report(baseline.json_bytes)) == baseline.json_bytes
+    assert baseline.sha256 != PILOT_GOLDEN_SHA256
+
+
+def test_the_baseline_run_hashes_are_the_canonical_hashes_not_the_raw_file_hash(bundle, baseline):
+    run = bundle[0]
+    freeze = baseline.document["freeze_binding"]
+    document_inputs = baseline.document["inputs"]
+    assert document_inputs["manifest"]["sha256"] == run.manifest_sha256 == freeze["canonical_manifest_sha256"]
+    assert document_inputs["dev_dataset"]["sha256"] == run.dev_dataset_sha256 == freeze["dev_label_binding_sha256"]
+    assert freeze["manifest_file_sha256"] not in (run.manifest_sha256, run.dev_dataset_sha256)
+    # the raw file hash is recorded, not compared with the run
+    other = freeze_of(run, manifest_file_sha256="e" * 64)
+    built = rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=other)
+    assert built["freeze_binding"]["manifest_file_sha256"] == "e" * 64
+
+
+def test_the_baseline_report_still_refuses_dev_text(bundle):
+    leak = fx.Q1.question
+    refused(rep.REPORT_LEAK, rep.build_report, *bundle, meta(embedder_signature=leak),
+            kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0]))
+
+
+# --- K4: build refusals ---
+
+@pytest.mark.parametrize("value", [None, {}, "x", dataclasses.asdict, 1])
+def test_a_baseline_requires_a_freeze_binding_object(bundle, value):
+    with pytest.raises(TypeError):
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=value)
+
+
+def test_a_dict_that_looks_like_a_binding_is_not_accepted(bundle):
+    with pytest.raises(TypeError):
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=dataclasses.asdict(freeze_of(bundle[0])))
+
+
+@pytest.mark.parametrize("kind", ["", "pilot", "Retrieval_Baseline", "v1_baseline", None, 1, b"retrieval_baseline"])
+def test_an_unknown_report_kind_is_refused(bundle, kind):
+    with pytest.raises(ValueError):
+        rep.build_report(*bundle, meta(), kind=kind)
+
+
+@pytest.mark.parametrize("over", [
+    {"dataset_version": "v1"}, {"dataset_version": "eval-dataset-v1.0"}, {"frozen_on": "2026-13-45"},
+    {"frozen_on": "2026-1-1"}, {"corpus_version": ""}, {"record_sha256": "A" * 64}, {"dev_file_sha256": "a" * 63},
+    {"dataset_json_sha256": ""}, {"manifest_file_sha256": 7}, {"frozen_on": None},
+])
+def test_a_malformed_binding_is_refused_with_a_fixed_message(bundle, over):
+    freeze = freeze_of(bundle[0], **over)
+    with pytest.raises(s.EvaluationDataError) as info:
+        rep.build_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze)
+    assert {i.code for i in info.value.issues} == {rep.REPORT_FREEZE_INVALID}
+    assert all(i.message == rep._MESSAGES[rep.REPORT_FREEZE_INVALID] for i in info.value.issues)
+    assert "2026-13-45" not in repr(info.value.issues) and "eval-dataset-v1.0" not in repr(info.value.issues)
+
+
+@pytest.mark.parametrize("field", ["dev_label_binding_sha256", "canonical_manifest_sha256"])
+def test_a_binding_that_disagrees_with_the_run_is_refused(bundle, field):
+    freeze = freeze_of(bundle[0], **{field: "f" * 64})
+    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze)
+    assert rep._MESSAGES[rep.REPORT_FREEZE_MISMATCH] and "f" * 64 not in repr(rep._MESSAGES)
+
+
+def test_the_raw_manifest_hash_is_not_accepted_in_place_of_the_canonical_one(bundle):
+    run = bundle[0]
+    # a raw-file-style hash, not the run's canonical one
+    freeze = freeze_of(run, canonical_manifest_sha256="d" * 64)
+    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze)
+    swapped = freeze_of(run, dev_label_binding_sha256=run.manifest_sha256,
+                        canonical_manifest_sha256=run.dev_dataset_sha256)
+    refused(rep.REPORT_FREEZE_MISMATCH, rep.build_report, *bundle, meta(), kind=rep.BASELINE_KIND, freeze=swapped)
+
+
+def test_the_baseline_keeps_every_existing_verification(bundle):
+    run, inputs, pool = bundle
+    freeze = freeze_of(run)
+    refused(rep.REPORT_HASH_MISMATCH, rep.build_report, dataclasses.replace(run, pool_size=7), inputs, pool, meta(),
+            kind=rep.BASELINE_KIND, freeze=freeze)
+    refused(rep.REPORT_EMBEDDER_MISMATCH, rep.build_report, run, inputs, pool, meta(embedder_id="other"),
+            kind=rep.BASELINE_KIND, freeze=freeze)
+    refused(rep.REPORT_METADATA_INVALID, rep.build_report, run, inputs, pool, meta(git_commit="xyz"),
+            kind=rep.BASELINE_KIND, freeze=freeze)
+
+
+# --- K5: strict loading ---
+
+BAD_HASHES = ["A" * 64, "a" * 63, "a" * 65, "", 7, None, ["a" * 64], "g" * 64]
+
+
+def loads_invalid(document):
+    refused(rep.REPORT_INVALID, rep.load_report, rep.serialize_report(document))
+
+
+def test_a_valid_baseline_loads_and_a_pilot_still_loads(baseline, rendered):
+    assert rep.load_report(baseline.json_bytes) == baseline.document
+    assert rep.load_report(rendered.json_bytes) == rendered.document
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.update(label=rep.REPORT_LABEL),
+    lambda d: d.update(label=rep.BASELINE_LABEL + "."),
+    lambda d: d.update(label="Retrieval-only dense V1 baseline (dev split)"),
+    lambda d: d.update(report_format_version=rep.REPORT_FORMAT_VERSION),
+    lambda d: d.update(report_format_version="e2.2-report-2"),
+    lambda d: d.update(is_v1_baseline=True),
+    lambda d: d.update(is_v1_baseline=0),
+    lambda d: d.update(is_v1_baseline=None),
+    lambda d: d.update(kind="validity_pilot"),
+    lambda d: d.update(kind="retrieval_baseline "),
+    lambda d: d.update(kind=["retrieval_baseline"]),
+    lambda d: d.pop("scope"),
+    lambda d: d.pop("freeze_binding"),
+    lambda d: d.update(scope=None),
+    lambda d: d.update(scope=[]),
+    lambda d: d.update(freeze_binding=None),
+    lambda d: d.update(freeze_binding=list(d["freeze_binding"].values())),
+])
+def test_a_tampered_baseline_header_is_refused(baseline, change):
+    loads_invalid(tampered(baseline.document, change))
+
+
+@pytest.mark.parametrize("key", sorted(rep.BASELINE_SCOPE))
+def test_every_scope_field_is_checked_exactly(baseline, key):
+    value = rep.BASELINE_SCOPE[key]
+    flipped = (not value) if isinstance(value, bool) else value + "-x"
+    loads_invalid(tampered(baseline.document, lambda d: d["scope"].update({key: flipped})))
+    loads_invalid(tampered(baseline.document, lambda d: d["scope"].pop(key)))
+    if isinstance(value, bool):
+        loads_invalid(tampered(baseline.document, lambda d: d["scope"].update({key: int(value)})))  # 0 is not false
+
+
+def test_an_extra_scope_key_is_refused(baseline):
+    loads_invalid(tampered(baseline.document, lambda d: d["scope"].update(extra=True)))
+
+
+def test_a_baseline_claiming_to_be_a_full_rag_baseline_is_refused(baseline):
+    loads_invalid(tampered(baseline.document, lambda d: d["scope"].update(full_rag_baseline=True)))
+    loads_invalid(tampered(baseline.document, lambda d: d["scope"].update(generation_evaluated=True)))
+
+
+@pytest.mark.parametrize("field", FREEZE_FIELDS)
+def test_a_missing_freeze_field_is_refused(baseline, field):
+    loads_invalid(tampered(baseline.document, lambda d: d["freeze_binding"].pop(field)))
+
+
+def test_an_extra_freeze_field_is_refused(baseline):
+    loads_invalid(tampered(baseline.document, lambda d: d["freeze_binding"].update(test_label_binding_sha256="a" * 64)))
+
+
+@pytest.mark.parametrize("value", BAD_HASHES)
+@pytest.mark.parametrize("field", HASH_FIELDS)
+def test_every_freeze_hash_must_be_64_lowercase_hex(baseline, field, value):
+    loads_invalid(tampered(baseline.document, lambda d: d["freeze_binding"].update({field: value})))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dataset_version", "eval-dataset-v1.0"), ("dataset_version", "eval-dataset-v1.0.0-rc1"),
+    ("dataset_version", "EVAL-DATASET-V1.0.0"), ("dataset_version", ""), ("dataset_version", 1),
+    ("dataset_version", "eval-dataset-v\u0661.0.0"),
+    ("frozen_on", "2026-13-45"), ("frozen_on", "2026-02-30"), ("frozen_on", "2026-1-1"), ("frozen_on", ""),
+    ("frozen_on", "20261114"), ("frozen_on", "2026-11-14T00:00:00"), ("frozen_on", "\u0662026-11-14"),
+    ("frozen_on", 20261114), ("corpus_version", ""), ("corpus_version", None), ("corpus_version", 1),
+])
+def test_the_freeze_version_date_and_corpus_are_checked(baseline, field, value):
+    loads_invalid(tampered(baseline.document, lambda d: d["freeze_binding"].update({field: value})))
+
+
+@pytest.mark.parametrize("field,path", [
+    ("dev_label_binding_sha256", ("dev_dataset", "sha256")), ("canonical_manifest_sha256", ("manifest", "sha256")),
+])
+def test_the_binding_must_agree_with_the_documents_own_input_hashes(baseline, field, path):
+    loads_invalid(tampered(baseline.document, lambda d: d["freeze_binding"].update({field: "e" * 64})))
+    loads_invalid(tampered(baseline.document, lambda d: d["inputs"][path[0]].update({path[1]: "e" * 64})))
+
+
+def test_the_raw_file_hashes_may_differ_from_the_run_hashes_when_loading(baseline):
+    document = tampered(baseline.document, lambda d: d["freeze_binding"].update(manifest_file_sha256="9" * 64))
+    assert rep.load_report(rep.serialize_report(document)) == document
+
+
+@pytest.mark.parametrize("data", [b"not json", b"[1]", b"\xff\xfe", b"{}", b'{"kind": "retrieval_baseline"}', b"null"])
+def test_garbage_is_still_refused(data):
+    refused(rep.REPORT_INVALID, rep.load_report, data)
+
+
+# --- K6: comparison ---
+
+def retargeted(document, field, value):
+    """A baseline whose freeze field AND the matching own input hash both hold ``value``: still internally valid."""
+    own = {"dev_label_binding_sha256": ("dev_dataset", "sha256"), "canonical_manifest_sha256": ("manifest", "sha256")}
+
+    def change(d):
+        d["freeze_binding"][field] = value
+        if field in own:
+            d["inputs"][own[field][0]][own[field][1]] = value
+
+    return tampered(document, change)
+
+
+def other_baseline(bundle, **over):
+    return rep.render_report(*bundle, meta(), kind=rep.BASELINE_KIND, freeze=freeze_of(bundle[0], **over))
+
+
+def test_two_baselines_of_the_same_run_are_comparable(bundle, baseline):
+    rep.check_comparable(baseline.document, tampered(baseline.document, lambda d: None))
+    rep.check_comparable(baseline.document, rep.load_report(baseline.json_bytes))
+    rep.check_comparable(baseline.document, other_baseline(bundle, record_sha256="a" * 64).document)
+
+
+def test_a_pilot_and_a_baseline_are_never_comparable(baseline, rendered):
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, rendered.document, baseline.document)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, baseline.document, rendered.document)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, rendered.document, baseline.document,
+            require_same_pool=False)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dataset_version", "eval-dataset-v9.9.9"), ("frozen_on", "2026-01-01"), ("corpus_version", "other"),
+    ("record_sha256", "e" * 64), ("dev_file_sha256", "e" * 64), ("dataset_json_sha256", "e" * 64),
+    ("manifest_file_sha256", "e" * 64), ("dev_label_binding_sha256", "e" * 64),
+    ("canonical_manifest_sha256", "e" * 64),
+])
+def test_baselines_with_different_freeze_bindings_are_not_comparable(baseline, field, value):
+    other = retargeted(baseline.document, field, value)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, baseline.document, other)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, other, baseline.document)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, baseline.document, other, require_same_pool=False)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.pop("freeze_binding"), lambda d: d.update(freeze_binding=None),
+    lambda d: d["freeze_binding"].pop("record_sha256"), lambda d: d["freeze_binding"].update(record_sha256="A" * 64),
+])
+def test_a_baseline_without_a_valid_freeze_binding_cannot_be_compared(baseline, change):
+    broken = tampered(baseline.document, change)
+    refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, broken)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, baseline.document)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, baseline.document, require_same_pool=False)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: (d["inputs"]["manifest"].update(sha256="e" * 64),
+               d["freeze_binding"].update(canonical_manifest_sha256="e" * 64)),
+    lambda d: (d["inputs"]["dev_dataset"].update(sha256="e" * 64),
+               d["freeze_binding"].update(dev_label_binding_sha256="e" * 64)),
+    lambda d: d["dense"].update(questions=list(reversed(d["dense"]["questions"]))),
+    lambda d: d["dense"].update(questions=d["dense"]["questions"][:-1]),
+    lambda d: d["settings"].update(cutoffs=d["settings"]["cutoffs"] + [99]),
+    lambda d: d["settings"].update(relevance_rules=list(reversed(d["settings"]["relevance_rules"]))),
+    lambda d: d["settings"]["series"]["binary_hit"][0].update(name="renamed"),
+])
+def test_every_existing_identity_check_still_applies_to_baselines(baseline, change):
+    other = tampered(baseline.document, change)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, baseline.document, other)
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, baseline.document, other, require_same_pool=False)
+
+
+def test_the_pool_check_applies_to_baselines_unless_relaxed(baseline):
+    other = tampered(baseline.document, lambda d: d["inputs"]["candidate_pool"].update(sha256="e" * 64))
+    refused(rep.REPORT_NOT_COMPARABLE, rep.check_comparable, baseline.document, other)
+    rep.check_comparable(baseline.document, other, require_same_pool=False)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["scope"].update(full_rag_baseline=True),
+    lambda d: d["scope"].update(generation_evaluated=1),
+    lambda d: d["scope"].update(retrieval_version="dense-v2"),
+    lambda d: d["scope"].update(extra=True),
+    lambda d: d["scope"].pop("split"),
+    lambda d: d.pop("scope"),
+    lambda d: d.update(scope=None),
+])
+@pytest.mark.parametrize("require_same_pool", [True, False])
+def test_an_invalid_baseline_scope_is_refused_even_against_itself(baseline, change, require_same_pool):
+    broken = tampered(baseline.document, change)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, broken, require_same_pool=require_same_pool)
+    refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, broken, require_same_pool=require_same_pool)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, baseline.document, require_same_pool=require_same_pool)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["freeze_binding"].update(dev_label_binding_sha256="e" * 64),
+    lambda d: d["freeze_binding"].update(canonical_manifest_sha256="e" * 64),
+    lambda d: d["inputs"]["dev_dataset"].update(sha256="e" * 64),
+    lambda d: d["inputs"]["manifest"].update(sha256="e" * 64),
+])
+@pytest.mark.parametrize("require_same_pool", [True, False])
+def test_a_baseline_whose_freeze_hash_disagrees_with_its_own_inputs_is_refused_even_against_itself(
+    baseline, change, require_same_pool,
+):
+    broken = tampered(baseline.document, change)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, broken, require_same_pool=require_same_pool)
+    refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, broken, require_same_pool=require_same_pool)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, baseline.document, require_same_pool=require_same_pool)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.update(label="other"), lambda d: d.update(is_v1_baseline=True), lambda d: d.update(is_v1_baseline=0),
+    lambda d: d.update(report_format_version="x"), lambda d: d.pop("label"),
+])
+@pytest.mark.parametrize("which", ["pilot", "baseline"])
+def test_label_version_and_v1_flag_are_checked_before_any_comparison(baseline, rendered, change, which):
+    document = (rendered if which == "pilot" else baseline).document
+    broken = tampered(document, change)
+    refused(rep.REPORT_INVALID, rep.check_comparable, broken, broken, require_same_pool=False)
+    refused(rep.REPORT_INVALID, rep.check_comparable, document, broken)
+
+
+def test_valid_comparisons_are_unchanged_by_the_complete_contract_check(bundle, baseline, rendered):
+    rep.check_comparable(rendered.document, rendered.document)
+    rep.check_comparable(baseline.document, baseline.document, require_same_pool=False)
+    rep.check_comparable(rendered.document, rep.load_report(rendered.json_bytes))
+    rep.check_comparable(baseline.document, rep.load_report(baseline.json_bytes))
+
+
+@pytest.mark.parametrize("kind", [None, "other", ["retrieval_baseline"], 1])
+def test_comparison_still_refuses_unknown_kinds_and_versions(baseline, kind):
+    broken = tampered(baseline.document, lambda d: d.update(kind=kind))
+    refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, broken)
+    wrong = tampered(baseline.document, lambda d: d.update(report_format_version=rep.REPORT_FORMAT_VERSION))
+    refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, wrong)
+    refused(rep.REPORT_INVALID, rep.check_comparable, {}, baseline.document)
+    refused(rep.REPORT_INVALID, rep.check_comparable, baseline.document, "text")
+
+
+# --- K7: purity and privacy ---
+
+def test_the_report_module_reads_no_file_except_for_the_code_identity():
+    tree = ast.parse(Path(rep.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name != "compute_code_identity":
+            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            attrs = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+            reads = {"read_bytes", "read_text", "open", "stat", "lstat", "exists"}
+            assert "open" not in names and not attrs & reads, node.name
+
+
+def test_the_baseline_document_holds_no_path_credential_or_test_split_content(baseline):
+    text = baseline.json_bytes.decode("utf-8")
+    assert "test.jsonl" not in text and "eval/dataset" not in text
+    assert baseline.document["inputs"]["dev_dataset"]["test_split_read"] is False

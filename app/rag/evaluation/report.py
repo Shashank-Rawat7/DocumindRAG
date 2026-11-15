@@ -10,6 +10,17 @@ reads files: the source of the evaluation, dense-retrieval and extraction module
 Label. Every report says ``"Validity pilot — not the V1 baseline"`` and ``is_v1_baseline: false``. The
 V1 baseline is a later, separate, frozen run (E2).
 
+Two kinds (E2.2). ``validity_pilot`` is the document above and its schema is unchanged. ``retrieval_baseline``
+is the retrieval-only dense development-split baseline of E2. It has the same sections and two more
+top-level keys: ``scope`` (``BASELINE_SCOPE``: retrieval only, dense, ``dense-v1``, dev split, no generation,
+no answer quality, not the full RAG baseline) and ``freeze_binding`` (the nine fields of a verified
+``freeze_binding.FreezeBinding``). It has its own format version and label, and ``is_v1_baseline`` stays
+false: it is never the full V1 RAG baseline. ``build_report`` requires the ``FreezeBinding`` for this kind
+and refuses unless its dev label-binding hash equals ``run.dev_dataset_sha256`` (``parsing.dataset_hash``)
+and its canonical manifest hash equals ``run.manifest_sha256`` (``parsing.manifest_hash``). The raw file
+hash of ``manifest.json`` is recorded in the binding but is not a report input hash: the report's manifest
+hash is the canonical one. The oracle and random sections stay as reference rows of the same run.
+
 Contents. Hashes of the manifest, the dev questions and the candidate pool; the run time and Python
 version; the code identity; the embedder id and signature; the content fingerprints of the
 read-only database snapshots taken before and after the run (when supplied); cutoffs, relevance rules, seeds, bootstrap
@@ -60,16 +71,34 @@ from app.rag.evaluation.aggregation import (
     STATUS_SUPPRESSED,
     Report,
 )
+from app.rag.evaluation.freeze_binding import FreezeBinding
 from app.rag.evaluation.metrics import MAX_RANK, RELEVANCE_RULES, RankedChunk
 from app.rag.evaluation.parsing import dataset_hash, manifest_hash
 from app.rag.evaluation.pool import CandidatePool
 from app.rag.evaluation.runner_inputs import DevInputs
-from app.rag.evaluation.schema import SEVERITY_ERROR, EvaluationDataError, Issue
+from app.rag.evaluation.schema import (
+    SEVERITY_ERROR,
+    SHA256_HEX_PATTERN,
+    EvaluationDataError,
+    Issue,
+)
 from app.rag.evaluation.structure import STRUCTURE_VERSION, derive_structure
 
 REPORT_FORMAT_VERSION = "e1.7-report-1"
 REPORT_KIND = "validity_pilot"
 REPORT_LABEL = "Validity pilot — not the V1 baseline"
+BASELINE_KIND = "retrieval_baseline"
+BASELINE_FORMAT_VERSION = "e2.2-report-1"
+BASELINE_LABEL = "Retrieval-only dense V1 baseline (dev split) — not the full V1 RAG baseline"
+BASELINE_SCOPE = {
+    "stage": "retrieval_only", "retrieval": "dense", "retrieval_version": "dense-v1", "split": "dev",
+    "generation_evaluated": False, "answer_quality_evaluated": False, "full_rag_baseline": False,
+}
+# kind -> (report_format_version, label)
+_CONTRACTS = {
+    REPORT_KIND: (REPORT_FORMAT_VERSION, REPORT_LABEL),
+    BASELINE_KIND: (BASELINE_FORMAT_VERSION, BASELINE_LABEL),
+}
 COMPARISON_NOTE = "Reported only: no dense-versus-random pass/fail threshold is approved or applied."
 UNANSWERABLE_NOTE = "Listed apart: no retrieval was run and no answerable retrieval metric is claimed."
 
@@ -82,6 +111,7 @@ CODE_IDENTITY_MODULES = (
     "app.rag.evaluation.baselines",
     "app.rag.evaluation.dataset",
     "app.rag.evaluation.engine",
+    "app.rag.evaluation.freeze_binding",
     "app.rag.evaluation.intervals",
     "app.rag.evaluation.metrics",
     "app.rag.evaluation.parsing",
@@ -112,6 +142,8 @@ REPORT_LEAK = "REPORT_LEAK"
 REPORT_NOT_COMPARABLE = "REPORT_NOT_COMPARABLE"
 REPORT_INVALID = "REPORT_INVALID"
 REPORT_IDENTITY_UNAVAILABLE = "REPORT_IDENTITY_UNAVAILABLE"
+REPORT_FREEZE_INVALID = "REPORT_FREEZE_INVALID"
+REPORT_FREEZE_MISMATCH = "REPORT_FREEZE_MISMATCH"
 
 _MESSAGES = {
     REPORT_HASH_MISMATCH: "a hash of the run disagrees with the inputs or the pool it is reported with",
@@ -122,13 +154,20 @@ _MESSAGES = {
     REPORT_UNSERIALIZABLE: "a value in the report has a type that cannot be serialised",
     REPORT_LEAK: "the report contains text that belongs to the dev questions or their evidence",
     REPORT_NOT_COMPARABLE: "the two reports were not produced against the same labels, questions or series",
-    REPORT_INVALID: "the report is not a valid validity-pilot report",
+    REPORT_INVALID: "the report is not a valid evaluation report",
     REPORT_IDENTITY_UNAVAILABLE: "the source of an identity module could not be read",
+    REPORT_FREEZE_INVALID: "the freeze binding of the report is malformed",
+    REPORT_FREEZE_MISMATCH: "the freeze binding disagrees with the dev-dataset or manifest hash of the run",
 }
 
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _MIN_FORBIDDEN = 6
+
+_FREEZE_FIELDS = tuple(f.name for f in dataclasses.fields(FreezeBinding))
+_FREEZE_HASHES = tuple(name for name in _FREEZE_FIELDS if name.endswith("_sha256"))
+_FREEZE_VERSION = re.compile(r"eval-dataset-v[0-9]+\.[0-9]+\.[0-9]+")
+_FREEZE_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 def _issue(code: str, location: str) -> Issue:
@@ -282,6 +321,83 @@ def _metrics(ids: Sequence[baselines.MetricId], values: Sequence[float]) -> dict
     return {engine.series_name(m): v for m, v in zip(ids, values)}
 
 
+# ---------- freeze binding (retrieval_baseline) ----------
+
+def _freeze_section_ok(section: object) -> bool:
+    """Exactly the nine FreezeBinding fields, all ``str``; six lowercase SHA-256 hex digests; a version of the
+    form ``eval-dataset-vMAJOR.MINOR.PATCH``; a real ``YYYY-MM-DD`` date; a non-empty corpus version."""
+    if not isinstance(section, Mapping) or not all(type(k) is str for k in section):
+        return False
+    if set(section) != set(_FREEZE_FIELDS) or not all(type(section[n]) is str for n in _FREEZE_FIELDS):
+        return False
+    if not all(SHA256_HEX_PATTERN.fullmatch(section[n]) for n in _FREEZE_HASHES):
+        return False
+    if _FREEZE_VERSION.fullmatch(section["dataset_version"]) is None or not section["corpus_version"]:
+        return False
+    if _FREEZE_DATE.fullmatch(section["frozen_on"]) is None:
+        return False
+    try:
+        datetime.strptime(section["frozen_on"], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _freeze_document(freeze: FreezeBinding, run: engine.PilotRun) -> dict[str, Any]:
+    """The ``freeze_binding`` section, after checking it against the run's dev-label and canonical manifest hashes."""
+    section = {name: getattr(freeze, name) for name in _FREEZE_FIELDS}
+    if not _freeze_section_ok(section):
+        raise _fail(REPORT_FREEZE_INVALID, "freeze")
+    if (
+        section["dev_label_binding_sha256"] != run.dev_dataset_sha256
+        or section["canonical_manifest_sha256"] != run.manifest_sha256
+    ):
+        raise _fail(REPORT_FREEZE_MISMATCH, "freeze")
+    return section
+
+
+def _same_json(first: Any, second: Any) -> bool:
+    """Equal as canonical JSON, so ``0`` is not ``false`` and ``1.0`` is not ``1``."""
+    try:
+        return json.dumps(first, sort_keys=True, allow_nan=False) == json.dumps(second, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+
+
+def _baseline_extras_ok(document: Mapping[str, Any]) -> bool:
+    """The baseline-only keys of a loaded document: the exact scope, a well-formed freeze binding, and the
+    binding's two run hashes equal to the document's own input hashes."""
+    section = document.get("freeze_binding")
+    if not _same_json(document.get("scope"), BASELINE_SCOPE) or not _freeze_section_ok(section):
+        return False
+    try:
+        inputs = document["inputs"]
+        return (
+            section["dev_label_binding_sha256"] == inputs["dev_dataset"]["sha256"]
+            and section["canonical_manifest_sha256"] == inputs["manifest"]["sha256"]
+        )
+    except (KeyError, TypeError):
+        return False
+
+
+def _contract(document: Mapping[str, Any]) -> tuple[str, str] | None:
+    kind = document.get("kind")
+    return _CONTRACTS.get(kind) if type(kind) is str else None
+
+
+def _contract_ok(document: object) -> bool:
+    """The complete contract of a loaded report: kind, format version, label and ``is_v1_baseline``; for a
+    ``retrieval_baseline`` also the exact scope and the freeze binding (see ``_baseline_extras_ok``)."""
+    contract = _contract(document) if isinstance(document, Mapping) else None
+    return (
+        contract is not None
+        and document.get("report_format_version") == contract[0]
+        and document.get("label") == contract[1]
+        and document.get("is_v1_baseline") is False
+        and (document["kind"] != BASELINE_KIND or _baseline_extras_ok(document))
+    )
+
+
 # ---------- verification ----------
 
 def _verify(run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata) -> None:
@@ -361,9 +477,23 @@ def _truncation(report: Report) -> list[list[int]]:
     return [[cutoff, count] for cutoff, count in report.overall.truncation]
 
 
-def build_report(run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata) -> dict[str, Any]:
-    """The JSON-ready report document (plain dicts, lists, strings, ints and finite floats)."""
+def build_report(
+    run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata,
+    *, kind: str = REPORT_KIND, freeze: FreezeBinding | None = None,
+) -> dict[str, Any]:
+    """The JSON-ready report document (plain dicts, lists, strings, ints and finite floats).
+
+    ``kind`` is ``validity_pilot`` (default; ``freeze`` must then be ``None``) or ``retrieval_baseline``
+    (``freeze`` must be the verified ``FreezeBinding`` of the frozen dev inputs).
+    """
+    if type(kind) is not str or kind not in _CONTRACTS:
+        raise ValueError("unknown report kind")
+    if kind == REPORT_KIND and freeze is not None:
+        raise ValueError("a validity_pilot report takes no freeze binding")
+    if kind == BASELINE_KIND and not isinstance(freeze, FreezeBinding):
+        raise TypeError("a retrieval_baseline report requires a FreezeBinding")
     _verify(run, inputs, pool, metadata)
+    freeze_section = _freeze_document(freeze, run) if kind == BASELINE_KIND else None
     structure = {q.question_id: derive_structure(q) for q in inputs.answerable}
     ids = run.questions[0].dense_scores.metric_ids if run.questions else ()
 
@@ -410,9 +540,9 @@ def build_report(run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, m
         + _slice_status(run.random_report, "random")
     )
     document = {
-        "report_format_version": REPORT_FORMAT_VERSION,
-        "kind": REPORT_KIND,
-        "label": REPORT_LABEL,
+        "report_format_version": _CONTRACTS[kind][0],
+        "kind": kind,
+        "label": _CONTRACTS[kind][1],
         "is_v1_baseline": False,
         "run": {
             "timestamp_utc": metadata.run_timestamp_utc, "python_version": metadata.python_version,
@@ -462,6 +592,9 @@ def build_report(run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, m
         },
         "suppressed_slices": suppressed,
     }
+    if freeze_section is not None:
+        document["scope"] = dict(BASELINE_SCOPE)
+        document["freeze_binding"] = freeze_section
     plain = _plain(document)
     _check_no_leak(plain, inputs)
     return plain
@@ -485,27 +618,28 @@ def serialize_report(document: Mapping[str, Any]) -> bytes:
     return (text + "\n").encode("utf-8")
 
 
-def render_report(run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata) -> SerializedReport:
-    document = build_report(run, inputs, pool, metadata)
+def render_report(
+    run: engine.PilotRun, inputs: DevInputs, pool: CandidatePool, metadata: RunMetadata,
+    *, kind: str = REPORT_KIND, freeze: FreezeBinding | None = None,
+) -> SerializedReport:
+    document = build_report(run, inputs, pool, metadata, kind=kind, freeze=freeze)
     data = serialize_report(document)
     return SerializedReport(document, data, hashlib.sha256(data).hexdigest())
 
 
 def load_report(data: bytes) -> dict[str, Any]:
-    """Parse a serialised report and check its kind, version and label (no other validation)."""
+    """Parse a serialised report and check its kind, version and label (no other validation).
+
+    A ``retrieval_baseline`` document is also checked for its exact ``scope`` and a well-formed
+    ``freeze_binding`` that agrees with the document's own input hashes.
+    """
     if type(data) is not bytes:
         raise TypeError("data must be bytes")
     try:
         document = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise _fail(REPORT_INVALID, "report") from None
-    if (
-        not isinstance(document, dict)
-        or document.get("kind") != REPORT_KIND
-        or document.get("report_format_version") != REPORT_FORMAT_VERSION
-        or document.get("label") != REPORT_LABEL
-        or document.get("is_v1_baseline") is not False
-    ):
+    if not isinstance(document, dict) or not _contract_ok(document):
         raise _fail(REPORT_INVALID, "report")
     return document
 
@@ -530,16 +664,22 @@ def check_comparable(first: Mapping[str, Any], second: Mapping[str, Any], *, req
     """Refuse (``EvaluationDataError``) unless the two reports used the same labels and questions.
 
     Compared: manifest hash, dev-dataset hash, question ids in order, cutoffs, relevance rules and series
-    names, and by default the candidate-pool hash. Both must be validity-pilot reports. Call this before
-    any comparison of two runs; the hashes are the proof that both were scored against the same labels.
+    names, and by default the candidate-pool hash. Both documents must first satisfy their complete contract
+    (``_contract_ok``: kind, version, label, ``is_v1_baseline`` and, for a baseline, the exact scope and a
+    freeze binding that agrees with the document's own input hashes), else ``REPORT_INVALID``, even when a
+    document is compared with itself. Both must be reports of the same kind: two validity pilots
+    or two retrieval baselines (a pilot and a baseline are never comparable). Two baselines must also hold the
+    same ``freeze_binding``; ``require_same_pool=False`` does not relax that. Call this before any comparison
+    of two runs; the hashes are the proof that both were scored against the same labels.
     """
     for document in (first, second):
-        if (
-            not isinstance(document, Mapping) or document.get("kind") != REPORT_KIND
-            or document.get("report_format_version") != REPORT_FORMAT_VERSION
-        ):
+        if not _contract_ok(document):
             raise _fail(REPORT_INVALID, "report")
+    if first["kind"] != second["kind"]:
+        raise _fail(REPORT_NOT_COMPARABLE, "reports.kind")
     if _identity(first) != _identity(second):
         raise _fail(REPORT_NOT_COMPARABLE, "reports")
+    if first["kind"] == BASELINE_KIND and not _same_json(first["freeze_binding"], second["freeze_binding"]):
+        raise _fail(REPORT_NOT_COMPARABLE, "reports.freeze_binding")
     if require_same_pool and first["inputs"]["candidate_pool"]["sha256"] != second["inputs"]["candidate_pool"]["sha256"]:
         raise _fail(REPORT_NOT_COMPARABLE, "reports.candidate_pool")
