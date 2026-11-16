@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { register } from './api'
 import { Link } from 'react-router-dom'
 
 function Register() {
@@ -15,43 +16,15 @@ function Register() {
     setLoading(true)
 
     try {
-      const response = await fetch(
-        'http://localhost:8000/api/v1/auth/register',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            email: email,
-            password: password,
-          }),
-        }
-      )
+      await register(email, password)
 
-      const data = await response.json()
-
-      if (response.ok) {
-        setSuccess('Account created successfully!')
-        setError('')
-        setEmail('')
-        setPassword('')
-      } 
-      else {
-          if (typeof data.detail === 'string') {
-            setError(data.detail)
-          } 
-          else if (Array.isArray(data.detail)) {
-            setError(data.detail[0].msg)
-          } 
-          else {
-            setError('Something went wrong.')
-          }
-          setSuccess('')
-        }
-    } 
-    catch (error) {
-      setError('Unable to connect to the server.')
+      setSuccess('Account created successfully!')
+      setError('')
+      setEmail('')
+      setPassword('')
+    }
+    catch (err) {
+      setError(err.message)
       setSuccess('')
     }
     finally {

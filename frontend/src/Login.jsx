@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { login } from './api'
 import { Link } from 'react-router-dom'
 import { useNavigate } from 'react-router-dom'
 
@@ -17,50 +18,20 @@ function Login() {
         setLoading(true)
 
         try {
-            const response = await fetch(
-            'http://localhost:8000/api/v1/auth/login',
-            {
-                method: 'POST',
-                headers: {
-                'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                email: email,
-                password: password,
-                }),
-            }
-            )
-
-            const data = await response.json()
-
-            if (response.ok) {
-            localStorage.setItem('access_token', data.access_token)
+            await login(email, password)
 
             setSuccess('Login successful!')
             setError('')
 
             navigate('/documents')
-            } 
-            else {
-            if (typeof data.detail === 'string') {
-                setError(data.detail)
-            } else if (Array.isArray(data.detail)) {
-                setError(data.detail[0].msg)
-            } else {
-                setError('Something went wrong.')
-            }
-            setSuccess('')
-            }
-        } 
-        catch (error) {
-            setError('Unable to connect to the server.')
+        }
+        catch (err) {
+            setError(err.message)
             setSuccess('')
         } 
         finally {
             setLoading(false)
         }
-        console.log('Status:', response.status)
-        console.log('Response:', data)
   }
        
   return (
