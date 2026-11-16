@@ -577,6 +577,17 @@ def test_an_invalid_snapshot_record_is_refused(bundle, record):
 # test_the_real_pilot_code_identity_changes_by_design_while_the_document_contract_does_not).
 PILOT_GOLDEN_BYTES = 431541
 PILOT_GOLDEN_SHA256 = "17178c03a6f4e1e9def787398bcaf4390901bd23045c6299494fe58f19d00f6a"
+# The golden was rendered on Python 3.10.12. A pilot report records the interpreter that ran the random baseline
+# (settings.random_reproducibility.python_version), and "3.10.12" is one byte longer than "3.12.4". That single
+# field is normalised before the comparison so the golden does not depend on the interpreter running the test.
+PILOT_GOLDEN_PYTHON_VERSION = "3.10.12"
+
+
+def pilot_golden_form(document):
+    """The pilot document serialised as it would be if the run had used the interpreter the golden was rendered on."""
+    clone = copy.deepcopy(document)
+    clone["settings"]["random_reproducibility"]["python_version"] = PILOT_GOLDEN_PYTHON_VERSION
+    return rep.serialize_report(clone)
 
 # CODE_IDENTITY_MODULES before E2.2.
 CODE_IDENTITY_BEFORE_E2_2 = (
@@ -650,8 +661,11 @@ def tampered(document, change):
 # --- K1: the pilot contract is unchanged ---
 
 def test_the_pilot_contract_golden_bytes_are_unchanged(rendered):
-    assert len(rendered.json_bytes) == PILOT_GOLDEN_BYTES
-    assert rendered.sha256 == PILOT_GOLDEN_SHA256
+    # Only the interpreter version is normalised; the report must still record the interpreter that really ran.
+    assert rendered.document["settings"]["random_reproducibility"]["python_version"] == rep.current_python_version()
+    golden_form = pilot_golden_form(rendered.document)
+    assert len(golden_form) == PILOT_GOLDEN_BYTES
+    assert hashlib.sha256(golden_form).hexdigest() == PILOT_GOLDEN_SHA256
 
 
 def test_the_pilot_constants_and_label_are_unchanged():
@@ -1454,7 +1468,8 @@ def test_the_pilot_has_no_determinism_section_and_its_version_is_unchanged(bundl
     assert rep.REPORT_FORMAT_VERSION == "e1.7-report-1"
     assert rendered.document["report_format_version"] == "e1.7-report-1"
     assert rep.BASELINE_FORMAT_VERSION == "e2.4-report-1"
-    assert rendered.sha256 == PILOT_GOLDEN_SHA256 and len(rendered.json_bytes) == PILOT_GOLDEN_BYTES
+    golden_form = pilot_golden_form(rendered.document)
+    assert hashlib.sha256(golden_form).hexdigest() == PILOT_GOLDEN_SHA256 and len(golden_form) == PILOT_GOLDEN_BYTES
 
 
 def test_a_pilot_document_carrying_the_section_is_refused_by_both_entry_points(rendered):

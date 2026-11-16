@@ -325,7 +325,15 @@ def test_a_recorded_canonical_manifest_hash_that_differs_fails_alone():
     assert result == [("FREEZE_MANIFEST_HASH_MISMATCH", "freeze_record.corpus.canonical_manifest_hash")]
 
 
-@pytest.mark.parametrize("dev", [b"", b"{", b"\xff\xfe", REAL[DEV][:-40], b'{"x": 1}\n'])
+# Explicit ids: the auto-generated id of the 36 KB truncated dev file exceeds the 32,767-character Windows limit
+# of the PYTEST_CURRENT_TEST environment variable (pytest 9.1.x has no id length cap).
+@pytest.mark.parametrize("dev", [
+    pytest.param(b"", id="empty"),
+    pytest.param(b"{", id="open-brace"),
+    pytest.param(b"\xff\xfe", id="invalid-utf8"),
+    pytest.param(REAL[DEV][:-40], id="truncated-by-40-bytes"),
+    pytest.param(b'{"x": 1}\n', id="not-a-question-record"),
+])
 def test_an_unreadable_dev_file_fails_closed(dev):
     result = failure(dev=dev)
     label_mismatch = ("FREEZE_LABEL_BINDING_MISMATCH", "freeze_record.label_binding_hashes.dev")
@@ -678,6 +686,10 @@ class FilesystemGuard:
             patch.setattr(pathlib.Path, name, method(getattr(pathlib.Path, name), record=True))
         for name in ("iterdir", "glob", "rglob"):
             patch.setattr(pathlib.Path, name, method(getattr(pathlib.Path, name), enumerate_=True))
+        # On Windows with Python 3.12 these are C functions (ntpath imports them from nt) that never call os.stat, so
+        # the os.stat patch above cannot see them. They only check; the wrapper calls the original exactly once.
+        for name in ("exists", "isfile", "isdir", "islink", "lexists"):
+            patch.setattr(os.path, name, checking(getattr(os.path, name)))
 
 
 @pytest.fixture
@@ -703,7 +715,11 @@ def test_the_guard_itself_trips_on_every_kind_of_access_to_the_test_file(tmp_pat
         lambda: sentinel.open("rb"),
         lambda: sentinel.resolve(),
         lambda: os.path.getsize(sentinel),
-        lambda: os.path.exists(sentinel),
+        lambda: os.path.exists(sentinel),  # a C function on Windows with Python 3.12: it never calls os.stat
+        lambda: os.path.isfile(sentinel),  # likewise
+        lambda: os.path.isdir(sentinel),  # likewise
+        lambda: os.path.islink(sentinel),  # likewise
+        lambda: os.path.lexists(sentinel),
     ):
         with pytest.raises(AssertionError, match="test split"):
             attempt()
@@ -712,10 +728,25 @@ def test_the_guard_itself_trips_on_every_kind_of_access_to_the_test_file(tmp_pat
 def test_the_guard_sees_enumeration_of_the_dataset_folder(tmp_path, guard):
     repo = make_repo(tmp_path, with_test_file=True)
     guard.start()
-    list(os.scandir(repo / "eval" / "dataset"))
-    os.listdir(repo / "eval" / "dataset")
-    list((repo / "eval" / "dataset").iterdir())
-    assert len(guard.enumerated) == 3
+    dataset = repo / "eval" / "dataset"
+    folder = os.fspath(dataset).replace("\\", "/")
+
+    def events_of(call) -> list[str]:
+        guard.enumerated.clear()
+        call()
+        return list(guard.enumerated)
+
+    # Each mechanism is checked on its own, and every event must name the dataset folder.
+    assert events_of(lambda: list(os.scandir(dataset))) == [folder]
+    assert events_of(lambda: os.listdir(dataset)) == [folder]
+    iterdir_events = events_of(lambda: list(dataset.iterdir()))
+    assert iterdir_events and set(iterdir_events) == {folder}
+    # Path.iterdir is version dependent. Before Python 3.12 it lists through a captured accessor, so only the patched
+    # Path.iterdir records it (one event). From 3.12 it calls os.listdir itself, so the patched os.listdir records it
+    # too (two events). On 3.12 and later this test therefore does not prove the Path.iterdir patch on its own:
+    # the enumeration is seen through os.listdir.
+    if sys.version_info < (3, 12):
+        assert len(iterdir_events) == 1
 
 
 def test_loading_the_binding_never_opens_stats_lists_or_hashes_the_test_file(tmp_path, guard):
