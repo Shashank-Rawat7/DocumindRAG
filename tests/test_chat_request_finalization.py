@@ -392,16 +392,23 @@ def test_unstarted_attempt_cannot_publish(owner):
     assert snapshot() == before
 
 
-def test_stale_worker_cannot_publish_after_takeover(owner):
+def test_stale_worker_cannot_publish_after_its_attempt_was_expired(owner):
+    # C9.5a: an expired, started attempt is never replaced, so there is no takeover; the
+    # stale worker simply finds its attempt settled and writes nothing.
     rid, old_attempt = ready(owner)
     expire_lease(old_attempt)
     call(expire_stale_attempt, rid)
-    _, new_attempt = ready(owner, request_id=rid)
     before = snapshot()
     assert publish(owner, rid, old_attempt).outcome is P.NOT_RUNNING  # the stale worker
     assert snapshot() == before
-    assert publish(owner, rid, new_attempt).outcome is P.PUBLISHED  # the current worker
-    assert attempt_row(old_attempt).status == "uncertain"
+    old = attempt_row(old_attempt)
+    # Settled by expiry: its charge is the retained reservation, and nothing changed it.
+    assert (old.status, old.charged_tokens, old.reserved_tokens) == (
+        "uncertain",
+        500,
+        500,
+    )
+    assert request_row(rid).status == "in_progress"
 
 
 # ---------------------------------------------------------------- ownership and rollback
@@ -920,20 +927,21 @@ def test_an_attempt_settled_by_another_transition_cannot_be_rejected(owner, sett
     assert snapshot() == before
 
 
-def test_a_stale_worker_cannot_reject_after_takeover(owner):
+def test_a_stale_worker_cannot_reject_after_its_attempt_was_expired(owner):
+    # C9.5a: no takeover exists any more; the expired attempt is settled and stays so.
     rid, old_aid = ready(owner)
     expire_lease(old_aid)
     assert call(expire_stale_attempt, rid).attempt_id == old_aid
-    new_rid, new_aid = ready(owner, request_id=rid)
     before = snapshot()
     assert reject(owner, rid, old_aid).outcome is R.NOT_RUNNING
     assert snapshot() == before
-    assert attempt_row(new_aid).status == "running"
+    old = attempt_row(old_aid)
+    assert (old.status, old.charged_tokens, old.reserved_tokens) == (
+        "uncertain",
+        500,
+        500,
+    )
     assert request_row(rid).status == "in_progress"
-    assert (
-        reject(owner, rid, new_aid).outcome is R.REJECTED
-    )  # the live worker still can
-    assert new_rid == rid
 
 
 # ---- atomicity: both rows change together or not at all

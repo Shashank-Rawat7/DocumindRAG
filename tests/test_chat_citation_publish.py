@@ -1364,17 +1364,21 @@ def test_a_reaped_attempt_cannot_be_failed_this_way(owner):
     assert snapshot() == before
 
 
-def test_a_stale_worker_cannot_fail_after_takeover(owner):
+def test_a_stale_worker_cannot_fail_after_its_attempt_was_expired(owner):
+    # C9.5a: no takeover exists any more; the expired attempt is settled and stays so.
     rid, old_aid = ready(owner)
     expire_lease(old_aid)
     assert call(expire_stale_attempt, rid).attempt_id == old_aid
-    _, new_aid = ready(owner, request_id=rid)
     before = snapshot()
     assert fail_gen(owner, rid, old_aid).outcome is F.NOT_RUNNING
-    assert snapshot() == before and attempt_row(new_aid).status == "running"
-    assert (
-        fail_gen(owner, rid, new_aid).outcome is F.FAILED
-    )  # the live worker still can
+    assert snapshot() == before
+    old = attempt_row(old_aid)
+    assert (old.status, old.charged_tokens, old.reserved_tokens) == (
+        "uncertain",
+        500,
+        500,
+    )
+    assert request_row(rid).status == "in_progress"
 
 
 @pytest.mark.parametrize(

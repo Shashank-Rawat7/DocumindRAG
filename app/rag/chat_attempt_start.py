@@ -30,7 +30,24 @@ Outcomes (nothing is written for any outcome except STARTED):
     REQUEST_NOT_FOUND      no such request for this owner (missing or someone else's)
     REQUEST_NOT_IN_PROGRESS  the request already succeeded or failed
     ATTEMPT_ALREADY_RUNNING  a running attempt exists (live or expired): no takeover here
+    GENERATION_ALREADY_ATTEMPTED  the request already has a succeeded, failed_with_usage,
+                           uncertain or rejected attempt (the 429 retry is unaffected)
     RETRY_LIMIT_REACHED    the request already has two rate_limited attempts (one 429 retry)
+
+Admission guard (C9.5a). No second non-429 generation attempt is admitted for a request; the
+explicitly permitted 429 retry remains available. Once an attempt ended ``succeeded``,
+``failed_with_usage``, ``uncertain`` or ``rejected`` (the statuses whose ``llm_started_at`` is
+set and that are not a 429), ``GENERATION_ALREADY_ATTEMPTED`` is returned and nothing is written.
+``failed_before_call`` and ``abandoned`` (provably never started) and ``rate_limited`` (the one
+approved retry) do not count. The guard is its own read-only statement, issued right after the
+running-attempt check and under the request lock, before the 429 cap and the quota check, so a
+request that already has such an attempt never reports quota or retry-limit outcomes instead.
+Why it is exact under READ COMMITTED: attempts are created only here, under the request lock;
+an attempt can enter one of these statuses only from ``running`` (worker settlement and expiry
+alike, neither of which takes the request lock); so once the running check has found nothing,
+no attempt can become one afterwards, and any that already did committed before the running
+check, so the next statement sees it. The two checks must stay separate statements in this
+order; tests pin the order and the isolation level.
 
 Not done here: stamping llm_started_at, finishing or abandoning an attempt, reaping and any
 request state change (see chat_attempt_lifecycle). The 429 retry cap counts only
@@ -68,6 +85,18 @@ _MAX_RATE_LIMITED_ATTEMPTS = (
 )
 
 
+# Terminal statuses of an attempt that was started (llm_started_at is set, enforced by
+# ck_chat_request_attempts_llm_started_consistent) and is not the approved 429 retry. 'rejected'
+# is included although it charges nothing: the provider answered, so it is not retried either.
+# 'running' is handled by its own check; 'rate_limited' never counts.
+_NON_RETRYABLE_STARTED_STATUSES = (
+    "succeeded",
+    "failed_with_usage",
+    "uncertain",
+    "rejected",
+)
+
+
 class AttemptStartArgumentError(ChatIdempotencyError):
     """An argument has an invalid type or value."""
 
@@ -78,6 +107,7 @@ class AttemptStartOutcome(str, Enum):
     REQUEST_NOT_FOUND = "request_not_found"
     REQUEST_NOT_IN_PROGRESS = "request_not_in_progress"
     ATTEMPT_ALREADY_RUNNING = "attempt_already_running"
+    GENERATION_ALREADY_ATTEMPTED = "generation_already_attempted"
     RETRY_LIMIT_REACHED = "retry_limit_reached"
 
 
@@ -150,6 +180,19 @@ def start_attempt(
         ).first()
         if has_running is not None:
             return AttemptStartResult(AttemptStartOutcome.ATTEMPT_ALREADY_RUNNING)
+
+        # 3a. No second provider attempt: a separate statement, after the running check above
+        # and under the same request lock (see "Admission guard" in the module docstring).
+        has_generated = db.execute(
+            select(attempt.id)
+            .where(
+                attempt.request_id == request_id,
+                attempt.status.in_(_NON_RETRYABLE_STARTED_STATUSES),
+            )
+            .limit(1)
+        ).first()
+        if has_generated is not None:
+            return AttemptStartResult(AttemptStartOutcome.GENERATION_ALREADY_ATTEMPTED)
 
         # 3b. At most one retry after a 429 (counted under the request lock held above).
         rate_limited = db.execute(

@@ -437,7 +437,7 @@ def test_expire_ignores_settled_attempts_other_requests_and_missing_requests(own
     assert call(expire_stale_attempt, other_request).outcome is ExpireOutcome.UNCERTAIN
 
 
-def test_takeover_after_expiry_counts_the_retained_reservation(owner):
+def test_expiry_retains_the_reservation_and_ends_admission_for_the_request(owner):
     attempt_id, request_id = new_attempt(owner, reserved=500, started=True)
     expire_lease(attempt_id)
     # Not yet expired: a new attempt is refused.
@@ -451,6 +451,7 @@ def test_takeover_after_expiry_counts_the_retained_reservation(owner):
     )
     assert refused.outcome is AttemptStartOutcome.ATTEMPT_ALREADY_RUNNING
     assert call(expire_stale_attempt, request_id).outcome is ExpireOutcome.UNCERTAIN
+    # C9.5a: the expired attempt reached the provider, so the request gets no second one ...
     second = call(
         start_attempt,
         owner,
@@ -459,8 +460,18 @@ def test_takeover_after_expiry_counts_the_retained_reservation(owner):
         daily_limit_tokens=LIMIT,
         lease_seconds=60,
     )
-    assert second.outcome is AttemptStartOutcome.STARTED
-    assert (second.attempt_number, second.used_tokens) == (2, 500)
+    assert second.outcome is AttemptStartOutcome.GENERATION_ALREADY_ATTEMPTED
+    # ... while its retained reservation still counts against the owner's other requests.
+    other = call(
+        start_attempt,
+        owner,
+        make_request(owner),
+        reserved_tokens=100,
+        daily_limit_tokens=LIMIT,
+        lease_seconds=60,
+    )
+    assert other.outcome is AttemptStartOutcome.STARTED
+    assert other.used_tokens == 500
 
 
 # ---------------------------------------------------------------- end to end
