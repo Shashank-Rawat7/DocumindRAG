@@ -11,7 +11,7 @@ class Message(Base):
     Messages are written only after a request completes successfully, so there is
     no status column. seq orders messages inside a conversation independently of
     timestamps. Ownership is NOT stored here: always join to conversations and
-    filter owner_id. Citations are not part of this table (added later by C9).
+    filter owner_id. Citations live in message_citations (C9.4b), written with the message.
     """
 
     __tablename__ = "messages"

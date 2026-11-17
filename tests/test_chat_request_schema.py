@@ -36,6 +36,7 @@ MIGRATION_8_FILE = (
     PROJECT_ROOT / "migrations" / "versions" / "c4f1a7d92b60_allow_rejected_attempt_status.py"
 )
 MIGRATION_8_REVISION = "c4f1a7d92b60"
+MIGRATION_9_REVISION = "a7d3e5f10c48"
 MIGRATION_8_CHANGED_CHECKS = {
     "ck_chat_request_attempts_status_valid",
     "ck_chat_request_attempts_llm_started_consistent",
@@ -260,12 +261,13 @@ def request_id(db, owner_id):
 
 # ---------- migration #7 position and registration ----------
 
-def test_migration_7_follows_migration_6_and_migration_8_is_the_newest_head():
+def test_migration_7_follows_migration_6_and_migration_9_is_the_newest_head():
     script = ScriptDirectory.from_config(Config(str(PROJECT_ROOT / "alembic.ini")))
 
     assert script.get_revision(MIGRATION_7_REVISION).down_revision == MIGRATION_7_DOWN_REVISION
     assert script.get_revision(MIGRATION_8_REVISION).down_revision == MIGRATION_7_REVISION
-    assert script.get_heads() == [MIGRATION_8_REVISION]
+    assert script.get_revision(MIGRATION_9_REVISION).down_revision == MIGRATION_8_REVISION
+    assert script.get_heads() == [MIGRATION_9_REVISION]
 
 
 def test_models_are_registered_in_app_main_and_alembic_env():

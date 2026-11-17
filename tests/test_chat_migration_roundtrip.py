@@ -44,6 +44,8 @@ C1_HEAD = "0b0212c1cca6"   # add pgvector and document chunks
 MIGRATION_6 = "4a06e23062ae"   # conversations, messages
 MIGRATION_7 = "e9749572298d"   # chat_requests, chat_request_attempts
 MIGRATION_8 = "c4f1a7d92b60"   # attempt status 'rejected' (three CHECKs)
+MIGRATION_9 = "a7d3e5f10c48"   # message_citations
+CITATION_TABLE = "message_citations"
 
 CHAT_TABLES_6 = ["conversations", "messages"]
 CHAT_TABLES_7 = ["chat_requests", "chat_request_attempts"]
@@ -332,6 +334,26 @@ def chat_6_content(engine):
     return [tuple(r) for r in conversations], [tuple(r) for r in messages]
 
 
+INSERT_CITATION_SQL = text(
+    "INSERT INTO message_citations (message_id, ordinal, marker, chunk_id, document_id, "
+    "chunk_index, start_offset, end_offset, page_start, page_end, span_sha256, "
+    "source_version, source_sha256) "
+    "VALUES (:m, 1, 1, :c, :d, 0, 0, 2, NULL, NULL, :h, 1, :h)"
+).bindparams(h=hashlib.sha256(b"c1").hexdigest())
+
+
+def citation_objects_left(engine):
+    """Constraints or indexes named for message_citations that survived a downgrade."""
+    with engine.connect() as conn:
+        constraints = conn.execute(text(
+            "SELECT conname FROM pg_constraint WHERE conname LIKE '%message\\_citations%'"
+        )).scalars().all()
+        indexes = conn.execute(text(
+            "SELECT indexname FROM pg_indexes WHERE indexname LIKE '%message\\_citations%'"
+        )).scalars().all()
+    return sorted([*constraints, *indexes])
+
+
 def seed_chat_7_data(engine, user_id, chat):
     """Two requests and three attempts (tables from migration #7), linked to chat 6 data."""
     sha = "a" * 64
@@ -470,9 +492,41 @@ def test_c7_round_trip_drops_only_chat_data_and_keeps_c1_data_and_pgvector(migra
     assert current_revision(engine) == MIGRATION_8
     assert_chat_requests_seeded(engine, requests, chat)
 
-    # 4. Downgrade #8 and #7: request and attempt data is LOST (by design); chat 6 data survives.
+    # 3e. Migration #9 only adds message_citations: every earlier table is identical and its
+    #     data survives. The downgrade refuses while a citation exists (evidence is never
+    #     destroyed silently), changes nothing, and drops the table once it is empty.
+    run_alembic("upgrade", MIGRATION_9)
+    assert current_revision(engine) == MIGRATION_9
+    assert CITATION_TABLE in table_names(engine)
+    assert schema_snapshot(engine, ALL_CHAT_TABLES) == snapshot_7
+    assert {t: snapshot_7[t] for t in CHAT_TABLES_6} == snapshot_6
+    assert_chat_requests_seeded(engine, requests, chat)
+    assert_c1_data_intact(engine, c1, installed_version)
+    with engine.begin() as conn:
+        conn.execute(INSERT_CITATION_SQL, {"m": chat["assistant_message"], "c": c1["chunk"],
+                                           "d": c1["document"]})
+    code, output = run_alembic_expecting_failure("downgrade", MIGRATION_8)
+    assert code != 0
+    assert "Refusing to downgrade" in output and CITATION_TABLE in output
+    assert current_revision(engine) == MIGRATION_9
+    assert row_count(engine, CITATION_TABLE) == 1
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM message_citations"))
+    run_alembic("downgrade", MIGRATION_8)
+    assert current_revision(engine) == MIGRATION_8
+    assert CITATION_TABLE not in table_names(engine)
+    assert citation_objects_left(engine) == []
+    assert schema_snapshot(engine, ALL_CHAT_TABLES) == snapshot_7
+    assert_chat_requests_seeded(engine, requests, chat)
+    run_alembic("upgrade", MIGRATION_9)
+    assert current_revision(engine) == MIGRATION_9
+    assert row_count(engine, CITATION_TABLE) == 0
+
+    # 4. Downgrade #9, #8 and #7: request and attempt data is LOST (by design); chat 6 data survives.
     run_alembic("downgrade", MIGRATION_6)
     assert current_revision(engine) == MIGRATION_6
+    assert CITATION_TABLE not in table_names(engine)
+    assert citation_objects_left(engine) == []
     assert table_names(engine).isdisjoint(CHAT_TABLES_7)          # tables, rows and ledger gone
     assert chat_request_objects_left(engine) == []                # no constraint/index left over
     assert set(CHAT_TABLES_6) <= table_names(engine)
@@ -495,9 +549,10 @@ def test_c7_round_trip_drops_only_chat_data_and_keeps_c1_data_and_pgvector(migra
 
     # 6. Re-upgrade to head: all four tables return EMPTY, identical in structure.
     run_alembic("upgrade", "head")
-    assert current_revision(engine) == MIGRATION_8
+    assert current_revision(engine) == MIGRATION_9
     assert set(ALL_CHAT_TABLES) <= table_names(engine)
-    for table in ALL_CHAT_TABLES:
+    assert CITATION_TABLE in table_names(engine)
+    for table in [*ALL_CHAT_TABLES, CITATION_TABLE]:
         assert row_count(engine, table) == 0, table               # nothing came back
     assert schema_snapshot(engine, ALL_CHAT_TABLES) == snapshot_7  # names, FKs, indexes unchanged
     assert_c1_data_intact(engine, c1, installed_version)

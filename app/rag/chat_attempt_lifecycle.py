@@ -10,6 +10,9 @@ Transitions of one ``chat_request_attempts`` row after ``start_attempt`` created
     mark_rate_limited  running, started      -> rate_limited         (charge 0)
     (rejected)         running, started      -> rejected             (charge 0), ONLY inside
                                                  reject_and_fail_request
+    (failed after generation) running, started -> failed_with_usage (charge = actual usage)
+                                                 or uncertain (no usage, charge = reserved),
+                                                 ONLY inside fail_request_after_generation
     expire_stale_attempt  running, lease expired -> abandoned (not started, charge 0)
                                                  or uncertain (started, charge = reserved)
 
@@ -44,7 +47,10 @@ transaction of its own and is used only by ``chat_request_finalization.publish_s
 Rejection is deliberately not public either: ``settle_rejected_in_transaction`` is used only by
 ``chat_request_finalization.reject_and_fail_request``, which settles the attempt and fails its
 request in ONE transaction, so no committed state has a rejected attempt with a request that is
-still in progress.
+still in progress. Failing after the provider generated an answer that cannot be published
+(for example invalid citations) is private for the same reason:
+``settle_failed_in_transaction`` is used only by
+``chat_request_finalization.fail_request_after_generation``.
 
 Not done here: any change to ``chat_requests``, messages or conversations (request
 finalization is C8.5), taking over after expiry (the caller expires, then calls
@@ -265,6 +271,46 @@ def settle_rejected_in_transaction(
         _settled("rejected", charged_tokens=0, error_code=error_code),
         started=True,
     )
+
+
+def settle_failed_in_transaction(
+    db: Session,
+    attempt_id: int,
+    error_code: str,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+) -> TransitionOutcome:
+    """Settle a started attempt whose generated answer could not be published.
+
+    Deliberately not public API (not in ``__all__``) and without a transaction of its own:
+    it must never be settled apart from failing its request, so only
+    ``chat_request_finalization.fail_request_after_generation`` calls this, in the same
+    transaction as the request update. Same fence as every worker write (running, lease
+    live, ``llm_started_at`` set). With usage the attempt is ``failed_with_usage`` and the
+    charge is prompt + completion; with no usage at all (both None) the provider reported
+    none, so it is ``uncertain`` and the charge is the reservation, exactly as a success
+    without usage is charged. The answer was generated either way, so a charge of 0 is
+    never an option here.
+    """
+    _check_id("attempt_id", attempt_id)
+    _check_error_code(error_code)
+    validate_optional_usage(prompt_tokens, completion_tokens)
+    if prompt_tokens is None:
+        # ``attempt.reserved_tokens`` is a column expression, not a value read earlier: the
+        # database copies the row's own reservation inside the fenced UPDATE below (the same
+        # pattern as mark_uncertain and expire_stale_attempt), on the row that statement locks.
+        values = _settled(
+            "uncertain", charged_tokens=attempt.reserved_tokens, error_code=error_code
+        )
+    else:
+        values = _settled(
+            "failed_with_usage",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            charged_tokens=prompt_tokens + completion_tokens,
+            error_code=error_code,
+        )
+    return _fenced_update(db, attempt_id, values, started=True)
 
 
 def fail_before_call(
