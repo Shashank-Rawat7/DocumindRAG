@@ -32,6 +32,15 @@ MIGRATION_7_FILE = (
 )
 MIGRATION_7_REVISION = "e9749572298d"
 MIGRATION_7_DOWN_REVISION = "4a06e23062ae"
+MIGRATION_8_FILE = (
+    PROJECT_ROOT / "migrations" / "versions" / "c4f1a7d92b60_allow_rejected_attempt_status.py"
+)
+MIGRATION_8_REVISION = "c4f1a7d92b60"
+MIGRATION_8_CHANGED_CHECKS = {
+    "ck_chat_request_attempts_status_valid",
+    "ck_chat_request_attempts_llm_started_consistent",
+    "ck_chat_request_attempts_charge_consistent",
+}
 ME = "/api/v1/auth/me"
 
 NOW = datetime.now(timezone.utc)
@@ -123,6 +132,9 @@ TERMINAL = {
     "abandoned": dict(
         status="abandoned", charged_tokens=0, llm_started_at=None, finished_at=NOW,
         error_code="lease_expired"),
+    "rejected": {
+        "status": "rejected", "charged_tokens": 0, "llm_started_at": NOW,
+        "finished_at": NOW, "error_code": "provider_rejected"},
 }
 # succeeded rows carry no error_code
 for _name in ("succeeded_with_usage", "succeeded_zero_usage", "succeeded_without_usage"):
@@ -137,6 +149,19 @@ def load_migration_7():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_migration_8():
+    spec = importlib.util.spec_from_file_location("migration_8_under_test", MIGRATION_8_FILE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def current_attempt_checks():
+    """The attempt CHECKs in force at head: migration 7's, with migration 8's replacing three."""
+    return {**dict(load_migration_7().ATTEMPT_CHECKS),
+            **dict(load_migration_8().ATTEMPT_CHECKS_CHANGED)}
 
 
 def model_checks(model):
@@ -235,11 +260,12 @@ def request_id(db, owner_id):
 
 # ---------- migration #7 position and registration ----------
 
-def test_migration_7_follows_migration_6_and_is_the_newest_head():
+def test_migration_7_follows_migration_6_and_migration_8_is_the_newest_head():
     script = ScriptDirectory.from_config(Config(str(PROJECT_ROOT / "alembic.ini")))
 
     assert script.get_revision(MIGRATION_7_REVISION).down_revision == MIGRATION_7_DOWN_REVISION
-    assert script.get_heads() == [MIGRATION_7_REVISION]
+    assert script.get_revision(MIGRATION_8_REVISION).down_revision == MIGRATION_7_REVISION
+    assert script.get_heads() == [MIGRATION_8_REVISION]
 
 
 def test_models_are_registered_in_app_main_and_alembic_env():
@@ -258,7 +284,7 @@ def test_model_and_migration_check_expressions_are_identical():
     migration = load_migration_7()
 
     assert model_checks(ChatRequest) == dict(migration.REQUEST_CHECKS)
-    assert model_checks(ChatRequestAttempt) == dict(migration.ATTEMPT_CHECKS)
+    assert model_checks(ChatRequestAttempt) == current_attempt_checks()
 
 
 # ---------- chat_requests: schema ----------
@@ -569,6 +595,68 @@ def test_status_valid_expression_accepts_exactly_the_seven_statuses():
 
     assert {s for s, ok in result.items() if ok} == set(candidates[:7])
     assert result["rejected"] is False
+
+
+def test_migration_8_changes_only_the_three_approved_checks_and_only_by_adding_rejected():
+    m7 = dict(load_migration_7().ATTEMPT_CHECKS)
+    m8 = load_migration_8()
+    changed = dict(m8.ATTEMPT_CHECKS_CHANGED)
+
+    assert set(changed) == MIGRATION_8_CHANGED_CHECKS <= set(m7)
+    # The previous texts it restores on downgrade are exactly migration 7's.
+    assert dict(m8.PREVIOUS_ATTEMPT_CHECKS_CHANGED) == {n: m7[n] for n in changed}
+    expected_new = {
+        "ck_chat_request_attempts_status_valid": m7[
+            "ck_chat_request_attempts_status_valid"].replace(
+            "'abandoned')", "'abandoned', 'rejected')"),
+        "ck_chat_request_attempts_llm_started_consistent": m7[
+            "ck_chat_request_attempts_llm_started_consistent"].replace(
+            "'rate_limited', 'uncertain') ", "'rate_limited', 'uncertain', 'rejected') "),
+        "ck_chat_request_attempts_charge_consistent": m7[
+            "ck_chat_request_attempts_charge_consistent"].replace(
+            "'abandoned', 'rate_limited')", "'abandoned', 'rate_limited', 'rejected')"),
+    }
+    assert changed == expected_new
+    assert all(changed[n] != m7[n] for n in changed)
+
+
+def test_status_valid_after_migration_8_accepts_exactly_the_eight_statuses():
+    expression = current_attempt_checks()["ck_chat_request_attempts_status_valid"]
+    candidates = ["running", "succeeded", "failed_before_call", "failed_with_usage",
+                  "rate_limited", "uncertain", "abandoned", "rejected",
+                  "failed", "in_progress", "REJECTED", "", "rejected "]
+    with engine.connect() as conn:
+        result = {s: conn.exec_driver_sql(f"SELECT {expression} FROM (SELECT %s AS status) t", (s,))
+                  .scalar_one() for s in candidates}
+
+    assert {s for s, ok in result.items() if ok} == set(candidates[:8])
+
+
+def test_every_attempt_check_in_force_is_total_including_rejected():
+    checks = list(current_attempt_checks().items())
+
+    nulls = null_results(checks, ATTEMPT_MATRIX)
+
+    assert {name: n for name, n in nulls.items() if name != USAGE} == {
+        name: 0 for name in EXPECTED_ATTEMPT_CHECKS - {USAGE}}
+
+
+def test_rejected_is_accepted_only_as_a_started_zero_charge_attempt_without_usage(db, request_id):
+    db.add(terminal_attempt(request_id, "rejected"))
+    db.commit()
+
+
+@pytest.mark.parametrize("overrides,constraints", [
+    ({"charged_tokens": 100}, (CHARGE,)),                               # reservation charged
+    ({"charged_tokens": 1}, (CHARGE,)),
+    ({"prompt_tokens": 10, "completion_tokens": 5, "charged_tokens": 0}, (CHARGE,)),   # usage present
+    ({"prompt_tokens": 0, "completion_tokens": 0, "charged_tokens": 0}, (CHARGE,)),
+    ({"llm_started_at": None}, (LLM_STARTED,)),                         # never started
+    ({"error_code": None}, (ERROR_CODE,)),                              # settled needs a code
+    ({"charged_tokens": None}, (NULL_IFF_RUNNING, CHARGE)),
+])
+def test_rejected_violations_are_rejected_by_the_named_check(db, request_id, overrides, constraints):
+    assert_violates(db, terminal_attempt(request_id, "rejected", **overrides), *constraints)
 
 
 # --- T-S1: every terminal status with charged_tokens = NULL must fail ---

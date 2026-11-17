@@ -100,6 +100,7 @@ def seed_one_of_each(owner):
     )
     add_attempt(owner, "uncertain", reserved=30, charged=30)  # retains reservation
     add_attempt(owner, "rate_limited", reserved=25, charged=0)
+    add_attempt(owner, "rejected", reserved=97, charged=0)
     add_attempt(owner, "failed_before_call", started=None, reserved=99, charged=0)
     add_attempt(owner, "abandoned", started=None, reserved=98, charged=0)
 
@@ -113,13 +114,18 @@ def test_empty_day_is_all_zero(owner):
 
 def test_every_status_contributes_what_the_rules_say(owner):
     seed_one_of_each(owner)
-    # settled = 15 + 40 + 21 + 30 + 0 (rate_limited) + 0 + 0; running = 7
+    # settled = 15 + 40 + 21 + 30 + 0 (rate_limited) + 0 (rejected) + 0 + 0; running = 7
     assert usage(owner) == DailyUsage(
         settled_tokens=106,
         running_reserved_tokens=7,
         total_tokens=113,
         unstarted_running_attempts=0,
     )
+
+
+def test_a_rejected_attempt_counts_nothing_whatever_its_reservation(owner):
+    add_attempt(owner, "rejected", reserved=4000, charged=0)
+    assert usage(owner) == DailyUsage(0, 0, 0, 0)
 
 
 def test_expired_unreaped_running_attempt_still_counts_its_reservation(owner):

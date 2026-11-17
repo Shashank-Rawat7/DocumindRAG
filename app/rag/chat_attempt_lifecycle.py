@@ -8,6 +8,8 @@ Transitions of one ``chat_request_attempts`` row after ``start_attempt`` created
     fail_with_usage    running, started      -> failed_with_usage    (charge = actual usage)
     mark_uncertain     running, started      -> uncertain            (charge = reserved)
     mark_rate_limited  running, started      -> rate_limited         (charge 0)
+    (rejected)         running, started      -> rejected             (charge 0), ONLY inside
+                                                 reject_and_fail_request
     expire_stale_attempt  running, lease expired -> abandoned (not started, charge 0)
                                                  or uncertain (started, charge = reserved)
 
@@ -33,12 +35,16 @@ expired) or WRONG_PHASE (llm_started_at is not in the state the transition needs
 Phases. ``llm_started_at`` is committed by ``mark_llm_started`` BEFORE the provider call, in
 its own transaction. NULL proves no call was issued, so only then may an attempt end as
 failed_before_call or abandoned; every attempt that may have reached the provider ends as
-succeeded, failed_with_usage, rate_limited or uncertain. ``mark_llm_started`` never moves an
+succeeded, failed_with_usage, rate_limited, rejected or uncertain. ``mark_llm_started`` never moves an
 existing timestamp (a second call is WRONG_PHASE), because that would move the UTC day.
 There is no lease extension: the caller's lease must outlast the provider call.
 
 Success is not a public transition here: ``settle_succeeded_in_transaction`` has no
 transaction of its own and is used only by ``chat_request_finalization.publish_success``.
+Rejection is deliberately not public either: ``settle_rejected_in_transaction`` is used only by
+``chat_request_finalization.reject_and_fail_request``, which settles the attempt and fails its
+request in ONE transaction, so no committed state has a rejected attempt with a request that is
+still in progress.
 
 Not done here: any change to ``chat_requests``, messages or conversations (request
 finalization is C8.5), taking over after expiry (the caller expires, then calls
@@ -238,6 +244,27 @@ def settle_succeeded_in_transaction(
             charged_tokens=prompt_tokens + completion_tokens,
         )
     return _fenced_update(db, attempt_id, values, started=True)
+
+
+def settle_rejected_in_transaction(
+    db: Session, attempt_id: int, error_code: str
+) -> TransitionOutcome:
+    """Settle a started attempt the provider rejected before generating (charge 0).
+
+    Deliberately not public API (not in ``__all__``) and without a transaction of its own:
+    a rejection must never be settled apart from failing its request, so only
+    ``chat_request_finalization.reject_and_fail_request`` calls this, in the same
+    transaction as the request update. Same fence as every worker write: the attempt must
+    be running, its lease live and ``llm_started_at`` set (the call was about to be issued).
+    """
+    _check_id("attempt_id", attempt_id)
+    _check_error_code(error_code)
+    return _fenced_update(
+        db,
+        attempt_id,
+        _settled("rejected", charged_tokens=0, error_code=error_code),
+        started=True,
+    )
 
 
 def fail_before_call(

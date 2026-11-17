@@ -4,10 +4,14 @@ Runs against documind_test. Attempts come from the real start_attempt and mark_l
 leases are moved with plain SQL; failures are injected with temporary database triggers.
 """
 
+import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -29,10 +33,12 @@ from app.rag.chat_request_finalization import (
     FailResult,
     FinalizationArgumentError,
     PublishOutcome,
+    RejectOutcome,
     RequestResult,
     fail_request,
     get_request_result,
     publish_success,
+    reject_and_fail_request,
 )
 from app.rag.chat_request_registration import RegistrationOutcome, register_request
 
@@ -42,6 +48,8 @@ QUESTION = "What is DocuMind?"
 ANSWER = "A RAG service."
 _counter = [0]
 P = PublishOutcome
+R = RejectOutcome
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -736,3 +744,583 @@ def test_every_call_commits_and_leaves_no_open_transaction(owner):
         assert get_request_result(db, owner, rid).status == "succeeded"
         assert not db.in_transaction()
     assert count("messages") == 2  # committed: visible from another connection
+
+
+# ---------------------------------------------------------------- reject_and_fail_request
+# C9.4a: one transaction settles a provider-rejected attempt (charge 0) AND fails its request.
+
+CODE = "provider_rejected"
+
+
+def reject(owner, request_id, attempt_id, code=CODE):
+    with SessionLocal() as db:
+        return reject_and_fail_request(db, owner, request_id, attempt_id, code)
+
+
+def half_settled_count():
+    """Rejected attempts whose request is still in progress: must always be zero."""
+    return execute(
+        "SELECT count(*) FROM chat_request_attempts a JOIN chat_requests r"
+        " ON r.id = a.request_id WHERE a.status = 'rejected' AND r.status = 'in_progress'"
+    ).scalar_one()
+
+
+@pytest.mark.parametrize("existing_conversation", [False, True])
+def test_reject_settles_zero_charge_and_fails_the_request_together(
+    owner, existing_conversation
+):
+    cid = make_conversation(owner, messages=2) if existing_conversation else None
+    rid, aid = ready(owner, conversation_id=cid, reserved=500)
+    messages_before = count("messages")
+    result = reject(owner, rid, aid)
+    assert result.outcome is R.REJECTED and result.current_status is None
+    a = attempt_row(aid)
+    assert (a.status, a.charged_tokens, a.error_code) == ("rejected", 0, CODE)
+    assert (a.prompt_tokens, a.completion_tokens, a.lease_expires_at) == (
+        None,
+        None,
+        None,
+    )
+    assert a.llm_started_at is not None and a.finished_at is not None
+    r = request_row(rid)
+    assert (r.status, r.error_code) == ("failed", CODE)
+    assert r.completed_at is not None
+    assert (r.user_message_id, r.assistant_message_id) == (None, None)
+    assert count("messages") == messages_before  # nothing published
+    assert count("conversations") == (1 if existing_conversation else 0)
+    assert half_settled_count() == 0
+
+
+def test_the_stored_failure_is_what_a_replay_returns(owner):
+    rid, aid = ready(owner)
+    assert reject(owner, rid, aid, "provider_unavailable").outcome is R.REJECTED
+    with SessionLocal() as db:
+        assert get_request_result(db, owner, rid) == RequestResult(
+            "failed", None, None, None, "provider_unavailable"
+        )
+    assert attempt_row(aid).error_code == "provider_unavailable"
+
+
+# ---- association: owner, request and attempt are validated together, before any write
+
+
+def test_attempt_request_owner_mismatches_are_not_found_and_change_nothing(
+    owner, other_owner
+):
+    rid, aid = ready(owner)
+    other_rid, other_aid = ready(other_owner)
+    before = snapshot()
+    assert (
+        reject(other_owner, rid, aid).outcome is R.REQUEST_NOT_FOUND
+    )  # not their request
+    assert (
+        reject(owner, rid, other_aid).outcome is R.REQUEST_NOT_FOUND
+    )  # attempt of another
+    assert (
+        reject(owner, other_rid, aid).outcome is R.REQUEST_NOT_FOUND
+    )  # request of another
+    assert reject(owner, other_rid, other_aid).outcome is R.REQUEST_NOT_FOUND
+    assert reject(owner, rid + 1000, aid).outcome is R.REQUEST_NOT_FOUND
+    assert reject(owner, rid, aid + 1000).outcome is R.REQUEST_NOT_FOUND
+    assert snapshot() == before  # both rows of both pairs untouched
+    assert (
+        reject(owner, rid, aid).outcome is R.REJECTED
+    )  # the correct triple still works
+    assert request_row(other_rid).status == "in_progress"
+    assert attempt_row(other_aid).status == "running"
+
+
+def test_a_second_request_of_the_owner_is_not_touched(owner):
+    rid, aid = ready(owner)
+    other_rid, other_aid = ready(owner)
+    before = {t: r for t, r in snapshot().items()}
+    assert reject(owner, rid, other_aid).outcome is R.REQUEST_NOT_FOUND
+    assert snapshot() == before
+    assert reject(owner, rid, aid).outcome is R.REJECTED
+    assert request_row(other_rid).status == "in_progress"
+    assert attempt_row(other_aid).status == "running"
+
+
+# ---- the request must still be in progress
+
+
+def test_a_second_identical_call_is_already_finalized_and_changes_nothing(owner):
+    rid, aid = ready(owner)
+    assert reject(owner, rid, aid).outcome is R.REJECTED
+    after_first = snapshot()
+    again = reject(owner, rid, aid)
+    assert (again.outcome, again.current_status) == (R.ALREADY_FINALIZED, "failed")
+    assert reject(owner, rid, aid, "other_code").outcome is R.ALREADY_FINALIZED
+    assert snapshot() == after_first
+    assert request_row(rid).error_code == CODE and attempt_row(aid).error_code == CODE
+
+
+def test_a_succeeded_request_cannot_be_rejected(owner):
+    rid, aid = ready(owner)
+    assert publish(owner, rid, aid).outcome is P.PUBLISHED
+    before = snapshot()
+    result = reject(owner, rid, aid)
+    assert (result.outcome, result.current_status) == (R.ALREADY_FINALIZED, "succeeded")
+    assert snapshot() == before
+
+
+def test_a_request_failed_by_fail_request_cannot_be_rejected(owner):
+    rid, aid = ready(owner)
+    assert (
+        call(mark_uncertain, aid, "timeout")
+        is lifecycle_module.TransitionOutcome.APPLIED
+    )
+    assert call(fail_request, owner, rid, "gave_up").outcome is FailOutcome.FAILED
+    before = snapshot()
+    result = reject(owner, rid, aid)
+    assert (result.outcome, result.current_status) == (R.ALREADY_FINALIZED, "failed")
+    assert snapshot() == before
+
+
+# ---- the C8.4 fence is unchanged
+
+
+def test_an_unstarted_attempt_cannot_be_rejected(owner):
+    rid, aid = ready(owner, started=False)
+    before = snapshot()
+    assert reject(owner, rid, aid).outcome is R.WRONG_PHASE
+    assert snapshot() == before and half_settled_count() == 0
+
+
+def test_an_expired_lease_cannot_be_rejected(owner):
+    rid, aid = ready(owner)
+    expire_lease(aid)
+    before = snapshot()
+    assert reject(owner, rid, aid).outcome is R.LEASE_EXPIRED
+    assert snapshot() == before  # still running until it is expired explicitly
+    assert request_row(rid).status == "in_progress"
+
+
+def test_a_reaped_attempt_cannot_be_rejected(owner):
+    rid, aid = ready(owner)
+    expire_lease(aid)
+    assert call(expire_stale_attempt, rid).attempt_id == aid
+    before = snapshot()
+    assert reject(owner, rid, aid).outcome is R.NOT_RUNNING
+    assert snapshot() == before
+    assert attempt_row(aid).status == "uncertain"
+    assert request_row(rid).status == "in_progress"
+
+
+@pytest.mark.parametrize("settle", ["uncertain", "rate_limited"])
+def test_an_attempt_settled_by_another_transition_cannot_be_rejected(owner, settle):
+    rid, aid = ready(owner)
+    function = {
+        "uncertain": lifecycle_module.mark_uncertain,
+        "rate_limited": lifecycle_module.mark_rate_limited,
+    }[settle]
+    assert call(function, aid, "code") is lifecycle_module.TransitionOutcome.APPLIED
+    before = snapshot()
+    assert reject(owner, rid, aid).outcome is R.NOT_RUNNING
+    assert snapshot() == before
+
+
+def test_a_stale_worker_cannot_reject_after_takeover(owner):
+    rid, old_aid = ready(owner)
+    expire_lease(old_aid)
+    assert call(expire_stale_attempt, rid).attempt_id == old_aid
+    new_rid, new_aid = ready(owner, request_id=rid)
+    before = snapshot()
+    assert reject(owner, rid, old_aid).outcome is R.NOT_RUNNING
+    assert snapshot() == before
+    assert attempt_row(new_aid).status == "running"
+    assert request_row(rid).status == "in_progress"
+    assert (
+        reject(owner, rid, new_aid).outcome is R.REJECTED
+    )  # the live worker still can
+    assert new_rid == rid
+
+
+# ---- atomicity: both rows change together or not at all
+
+
+@pytest.mark.parametrize(
+    "table, when",
+    [
+        ("chat_request_attempts", "NEW.status = 'rejected'"),  # attempt update fails
+        (
+            "chat_requests",
+            "NEW.status = 'failed'",
+        ),  # request update fails after the attempt's
+    ],
+)
+def test_a_database_failure_at_either_update_leaves_nothing_behind(owner, table, when):
+    rid, aid = ready(owner)
+    before = snapshot()
+    with boom_trigger(table, when), pytest.raises(DBAPIError):
+        reject(owner, rid, aid)
+    assert snapshot() == before
+    assert attempt_row(aid).status == "running"
+    assert request_row(rid).status == "in_progress"
+    assert half_settled_count() == 0
+    # Nothing stayed locked or half-done: the same call works once the fault is gone.
+    assert reject(owner, rid, aid).outcome is R.REJECTED
+
+
+def test_a_python_failure_between_the_two_updates_rolls_the_attempt_back(
+    owner, monkeypatch
+):
+    rid, aid = ready(owner)
+    before = snapshot()
+
+    def explode(*args, **kwargs):
+        raise KeyboardInterrupt("simulated crash between the two updates")
+
+    monkeypatch.setattr(finalization_module, "_set_failed", explode)
+    with pytest.raises(KeyboardInterrupt):
+        reject(owner, rid, aid)
+    assert snapshot() == before
+    monkeypatch.undo()
+    assert reject(owner, rid, aid).outcome is R.REJECTED
+
+
+def test_a_failed_request_update_after_a_settled_attempt_rolls_everything_back(
+    owner, monkeypatch
+):
+    rid, aid = ready(owner)
+    before = snapshot()
+    monkeypatch.setattr(finalization_module, "_set_failed", lambda *a, **k: False)
+    with pytest.raises(RuntimeError):
+        reject(owner, rid, aid)
+    assert snapshot() == before
+    assert half_settled_count() == 0
+
+
+def test_a_failure_while_settling_the_attempt_leaves_the_request_untouched(
+    owner, monkeypatch
+):
+    rid, aid = ready(owner)
+    before = snapshot()
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("settlement failed")
+
+    monkeypatch.setattr(finalization_module, "settle_rejected_in_transaction", explode)
+    with pytest.raises(RuntimeError):
+        reject(owner, rid, aid)
+    assert snapshot() == before
+
+
+# ---- crash safety
+
+
+CRASH_SCRIPT = """
+import os, sys
+import app.rag.chat_request_finalization as f
+from app.core.database import SessionLocal
+
+def die(*args, **kwargs):
+    os._exit(17)          # the process dies between the attempt update and the request update
+
+f._set_failed = die
+owner, request_id, attempt_id = (int(v) for v in sys.argv[1:4])
+with SessionLocal() as db:
+    f.reject_and_fail_request(db, owner, request_id, attempt_id, "provider_rejected")
+os._exit(0)
+"""
+
+
+def test_a_process_crash_between_the_updates_commits_neither_row(owner):
+    rid, aid = ready(owner, reserved=500)
+    before = snapshot()
+    done = subprocess.run(
+        [sys.executable, "-c", CRASH_SCRIPT, str(owner), str(rid), str(aid)],
+        cwd=PROJECT_ROOT,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 17, done.stderr  # it really died mid-transaction
+    assert snapshot() == before  # the server rolled the dead session back
+    assert half_settled_count() == 0
+    assert (
+        attempt_row(aid).status == "running"
+        and request_row(rid).status == "in_progress"
+    )
+
+    # Recovery is the existing conservative path: expire (uncertain, reservation kept), fail.
+    assert call(fail_request, owner, rid, "x").outcome is FailOutcome.ATTEMPT_RUNNING
+    expire_lease(aid)
+    assert call(expire_stale_attempt, rid).attempt_id == aid
+    a = attempt_row(aid)
+    assert (a.status, a.charged_tokens, a.error_code) == (
+        "uncertain",
+        500,
+        "lease_expired",
+    )
+    assert call(fail_request, owner, rid, "lease_expired").outcome is FailOutcome.FAILED
+    assert half_settled_count() == 0
+
+
+def test_the_half_settled_check_detects_a_violation_and_the_function_never_makes_one(
+    owner,
+):
+    rid, aid = ready(owner)
+    other = make_request(owner)
+    execute(  # manufactured violation, bypassing the function (control for the query)
+        "INSERT INTO chat_request_attempts (request_id, attempt_number, status, reserved_tokens,"
+        " charged_tokens, llm_started_at, finished_at, error_code)"
+        " VALUES (:r, 1, 'rejected', 100, 0, now(), now(), 'x')",
+        r=other,
+    )
+    assert half_settled_count() == 1
+    execute("DELETE FROM chat_request_attempts WHERE request_id = :r", r=other)
+    # Every outcome of the function leaves the invariant intact.
+    expired_rid, expired_aid = ready(owner)
+    expire_lease(expired_aid)
+    unstarted_rid, unstarted_aid = ready(owner, started=False)
+    for args in (
+        (owner, rid, aid),
+        (owner, rid, aid),
+        (owner, rid + 999, aid),
+        (owner, expired_rid, expired_aid),
+        (owner, unstarted_rid, unstarted_aid),
+    ):
+        reject(*args)
+        assert half_settled_count() == 0
+
+
+def test_rejection_is_only_reachable_through_the_atomic_operation():
+    app_dir = PROJECT_ROOT / "app"
+    users = {
+        p.name
+        for p in app_dir.rglob("*.py")
+        if "settle_rejected_in_transaction" in p.read_text(encoding="utf-8")
+    }
+    assert users == {"chat_attempt_lifecycle.py", "chat_request_finalization.py"}
+    assert not any(
+        "def mark_rejected" in p.read_text(encoding="utf-8")
+        for p in app_dir.rglob("*.py")
+    )
+    assert "reject_and_fail_request" in finalization_module.__all__
+    assert "settle_rejected_in_transaction" not in finalization_module.__all__
+    assert "settle_rejected_in_transaction" not in lifecycle_module.__all__
+
+
+# ---- concurrency
+
+
+def test_concurrent_rejects_of_one_attempt_apply_exactly_once(owner):
+    rid, aid = ready(owner)
+    results = run_threads(
+        6, lambda db, i: reject_and_fail_request(db, owner, rid, aid, CODE)
+    )
+    outcomes = [r.outcome for r in results]
+    assert outcomes.count(R.REJECTED) == 1
+    assert outcomes.count(R.ALREADY_FINALIZED) == 5
+    assert (request_row(rid).status, attempt_row(aid).status) == ("failed", "rejected")
+
+
+def test_reject_and_publish_never_both_win(owner):
+    for _ in range(10):
+        rid, aid = ready(owner)
+
+        def work(db, i, rid=rid, aid=aid):
+            if i == 0:
+                return publish_success(
+                    db, owner, rid, aid, user_content=QUESTION, assistant_content=ANSWER
+                )
+            return reject_and_fail_request(db, owner, rid, aid, CODE)
+
+        published, rejected = run_threads(2, work)
+        request, attempt = request_row(rid), attempt_row(aid)
+        if published.outcome is P.PUBLISHED:
+            assert rejected.outcome is R.ALREADY_FINALIZED
+            assert (request.status, attempt.status) == ("succeeded", "succeeded")
+        else:
+            assert published.outcome is P.REQUEST_FAILED
+            assert rejected.outcome is R.REJECTED
+            assert (request.status, attempt.status) == ("failed", "rejected")
+        assert half_settled_count() == 0
+
+
+def test_reject_and_fail_request_never_conflict(owner):
+    for _ in range(5):
+        rid, aid = ready(owner)
+
+        def work(db, i, rid=rid, aid=aid):
+            if i == 0:
+                return reject_and_fail_request(db, owner, rid, aid, CODE)
+            return fail_request(db, owner, rid, "gave_up")
+
+        rejected, failed = run_threads(2, work)
+        assert (
+            rejected.outcome is R.REJECTED
+        )  # fail_request refuses while the attempt runs
+        assert failed.outcome in (
+            FailOutcome.ATTEMPT_RUNNING,
+            FailOutcome.ALREADY_FINALIZED,
+        )
+        assert (request_row(rid).error_code, attempt_row(aid).status) == (
+            CODE,
+            "rejected",
+        )
+
+
+def test_reject_and_expiry_are_mutually_exclusive(owner):
+    rid, aid = ready(owner)
+    expire_lease(aid)
+    rejected, expired = run_threads(
+        2,
+        lambda db, i: (
+            reject_and_fail_request(db, owner, rid, aid, CODE)
+            if i == 0
+            else expire_stale_attempt(db, rid)
+        ),
+    )
+    assert rejected.outcome in (R.LEASE_EXPIRED, R.NOT_RUNNING)
+    assert expired.attempt_id == aid
+    assert (attempt_row(aid).status, request_row(rid).status) == (
+        "uncertain",
+        "in_progress",
+    )
+    assert half_settled_count() == 0
+
+
+def test_a_live_lease_is_never_expired_by_a_concurrent_reject(owner):
+    rid, aid = ready(owner)
+    rejected, expired = run_threads(
+        2,
+        lambda db, i: (
+            reject_and_fail_request(db, owner, rid, aid, CODE)
+            if i == 0
+            else expire_stale_attempt(db, rid)
+        ),
+    )
+    assert rejected.outcome is R.REJECTED
+    assert expired.outcome is lifecycle_module.ExpireOutcome.NOTHING_TO_EXPIRE
+    assert (attempt_row(aid).status, request_row(rid).status) == ("rejected", "failed")
+
+
+# ---- quota accounting and what the request can do afterwards
+
+
+def test_a_rejection_releases_the_reservation_and_charges_nothing(owner, other_owner):
+    rid, aid = ready(owner, reserved=500)
+    other_rid, other_aid = ready(other_owner, reserved=700)
+    today = datetime.now(UTC).date()
+    with SessionLocal() as db:
+        before = get_daily_usage(db, owner, today)
+    assert (before.running_reserved_tokens, before.settled_tokens) == (500, 0)
+    assert reject(owner, rid, aid).outcome is R.REJECTED
+    with SessionLocal() as db:
+        after = get_daily_usage(db, owner, today)
+        other = get_daily_usage(db, other_owner, today)
+    assert (
+        after.running_reserved_tokens,
+        after.settled_tokens,
+        after.total_tokens,
+    ) == (0, 0, 0)
+    assert (
+        other.running_reserved_tokens == 700
+    )  # another owner's reservation is untouched
+    assert attempt_row(other_aid).status == "running"
+    assert request_row(other_rid).status == "in_progress"
+
+
+def test_the_request_cannot_start_another_attempt_after_a_rejection(owner):
+    rid, aid = ready(owner)
+    assert reject(owner, rid, aid).outcome is R.REJECTED
+    result = call(
+        start_attempt,
+        owner,
+        rid,
+        reserved_tokens=500,
+        daily_limit_tokens=LIMIT,
+        lease_seconds=600,
+    )
+    assert result.outcome is AttemptStartOutcome.REQUEST_NOT_IN_PROGRESS
+    assert count("chat_request_attempts") == 1
+
+
+def test_a_rejection_after_a_429_retry_fails_the_request_with_two_settled_attempts(
+    owner,
+):
+    rid, first = ready(owner)
+    assert call(lifecycle_module.mark_rate_limited, first, "http_429") is (
+        lifecycle_module.TransitionOutcome.APPLIED
+    )
+    _, second = ready(owner, request_id=rid)
+    assert reject(owner, rid, second).outcome is R.REJECTED
+    statuses = [
+        r.status
+        for r in execute(
+            "SELECT status FROM chat_request_attempts ORDER BY attempt_number"
+        ).all()
+    ]
+    assert statuses == ["rate_limited", "rejected"]
+    assert request_row(rid).status == "failed"
+
+
+# ---- arguments and transactions
+
+
+@pytest.mark.parametrize("bad", [None, True, 0, -1, 1.0, "1", 2_147_483_648])
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_invalid_ids_are_rejected_before_anything_runs(owner, bad, position):
+    rid, aid = ready(owner)
+    before = snapshot()
+    args = [owner, rid, aid]
+    args[position] = bad
+    with pytest.raises(FinalizationArgumentError):
+        reject(*args)
+    assert snapshot() == before
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "A", "1code", "co de", "co-de", "a" * 65, "code\n", None, 5]
+)
+def test_invalid_error_codes_are_rejected_before_anything_runs(owner, bad):
+    rid, aid = ready(owner)
+    before = snapshot()
+    with pytest.raises(FinalizationArgumentError):
+        reject(owner, rid, aid, bad)
+    assert snapshot() == before
+
+
+def test_reject_session_with_open_transaction_fails_loudly(owner):
+    rid, aid = ready(owner)
+    with SessionLocal() as db:
+        db.execute(text("SELECT 1"))
+        with pytest.raises(InvalidRequestError):
+            reject_and_fail_request(db, owner, rid, aid, CODE)
+    assert (request_row(rid).status, attempt_row(aid).status) == (
+        "in_progress",
+        "running",
+    )
+
+
+def test_reject_commits_and_leaves_no_open_transaction(owner):
+    rid, aid = ready(owner)
+    with SessionLocal() as db:
+        assert reject_and_fail_request(db, owner, rid, aid, CODE).outcome is R.REJECTED
+        assert not db.in_transaction()
+        assert (
+            reject_and_fail_request(db, owner, rid, aid, CODE).outcome
+            is R.ALREADY_FINALIZED
+        )
+        assert not db.in_transaction()
+        assert reject_and_fail_request(db, owner, rid + 999, aid, CODE).outcome is (
+            R.REQUEST_NOT_FOUND
+        )
+        assert not db.in_transaction()
+    assert (request_row(rid).status, attempt_row(aid).status) == ("failed", "rejected")
+
+
+def test_fail_request_still_writes_the_same_failed_state(owner):
+    """Regression for the _set_failed extraction: fail_request behaves as before."""
+    rid = make_request(owner)
+    assert call(fail_request, owner, rid, "gave_up").outcome is FailOutcome.FAILED
+    r = request_row(rid)
+    assert (r.status, r.error_code) == ("failed", "gave_up")
+    assert r.completed_at is not None
+    assert (
+        call(fail_request, owner, rid, "again").outcome is FailOutcome.ALREADY_FINALIZED
+    )

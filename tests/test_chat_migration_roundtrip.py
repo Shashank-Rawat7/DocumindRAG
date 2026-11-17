@@ -43,6 +43,7 @@ MIGRATION_TEST_DATABASE_NAME = "documind_migration_test"
 C1_HEAD = "0b0212c1cca6"   # add pgvector and document chunks
 MIGRATION_6 = "4a06e23062ae"   # conversations, messages
 MIGRATION_7 = "e9749572298d"   # chat_requests, chat_request_attempts
+MIGRATION_8 = "c4f1a7d92b60"   # attempt status 'rejected' (three CHECKs)
 
 CHAT_TABLES_6 = ["conversations", "messages"]
 CHAT_TABLES_7 = ["chat_requests", "chat_request_attempts"]
@@ -129,6 +130,27 @@ def run_alembic(*args):
         env=alembic_subprocess_env(),
         check=True,
     )
+
+
+def run_alembic_expecting_failure(*args):
+    """Run Alembic and return its exit code and combined output; the caller asserts failure."""
+    if not _safety_checks_passed:
+        raise RuntimeError("Refusing to run Alembic before the migration database safety checks.")
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", *args],
+        cwd=PROJECT_ROOT,
+        env=alembic_subprocess_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+REJECTED_ATTEMPT_SQL = text(
+    "INSERT INTO chat_request_attempts (request_id, attempt_number, status, reserved_tokens, "
+    "charged_tokens, llm_started_at, finished_at, error_code) "
+    "VALUES (:r, 2, 'rejected', 100, 0, now(), now(), 'provider_rejected')")
 
 
 @pytest.fixture(scope="module")
@@ -405,7 +427,50 @@ def test_c7_round_trip_drops_only_chat_data_and_keeps_c1_data_and_pgvector(migra
     assert "ix_chat_request_attempts_llm_started_at" in attempt_indexes
     assert_c1_data_intact(engine, c1, installed_version)
 
-    # 4. Downgrade #7: request and attempt data is LOST (by design); chat 6 data survives.
+    # 3b. Migration #8 changes only the three attempt CHECKs: names, FKs and indexes are
+    #     identical, the seeded #7 rows survive, and 'rejected' becomes a valid status.
+    run_alembic("upgrade", MIGRATION_8)
+    assert current_revision(engine) == MIGRATION_8
+    assert_chat_requests_seeded(engine, requests, chat)
+    assert schema_snapshot(engine, ALL_CHAT_TABLES) == snapshot_7
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        conn.execute(REJECTED_ATTEMPT_SQL, {"r": requests["pending"]})   # accepted at #8
+        transaction.rollback()
+    assert_c1_data_intact(engine, c1, installed_version)
+
+    # 3c. Downgrade #8 refuses while a 'rejected' attempt exists and changes nothing.
+    with engine.begin() as conn:
+        conn.execute(REJECTED_ATTEMPT_SQL, {"r": requests["pending"]})
+    code, output = run_alembic_expecting_failure("downgrade", MIGRATION_7)
+    assert code != 0
+    assert "cannot downgrade" in output and "'rejected'" in output
+    assert current_revision(engine) == MIGRATION_8
+    assert row_count(engine, "chat_request_attempts") == 4
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM chat_request_attempts WHERE status = 'rejected'"))
+
+    # 3d. Without rejected rows, downgrade #8 restores #7 exactly: seeded data intact and
+    #     'rejected' is invalid again; then upgrade to #8 once more.
+    run_alembic("downgrade", MIGRATION_7)
+    assert current_revision(engine) == MIGRATION_7
+    assert_chat_requests_seeded(engine, requests, chat)
+    assert schema_snapshot(engine, ALL_CHAT_TABLES) == snapshot_7
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        with pytest.raises(IntegrityError) as old_status:
+            conn.execute(REJECTED_ATTEMPT_SQL, {"r": requests["pending"]})
+        transaction.rollback()
+    # 'rejected' breaks several #7 CHECKs at once; PostgreSQL names whichever it checks first.
+    assert old_status.value.orig.diag.constraint_name in {
+        "ck_chat_request_attempts_status_valid",
+        "ck_chat_request_attempts_charge_consistent",
+    }
+    run_alembic("upgrade", MIGRATION_8)
+    assert current_revision(engine) == MIGRATION_8
+    assert_chat_requests_seeded(engine, requests, chat)
+
+    # 4. Downgrade #8 and #7: request and attempt data is LOST (by design); chat 6 data survives.
     run_alembic("downgrade", MIGRATION_6)
     assert current_revision(engine) == MIGRATION_6
     assert table_names(engine).isdisjoint(CHAT_TABLES_7)          # tables, rows and ledger gone
@@ -430,7 +495,7 @@ def test_c7_round_trip_drops_only_chat_data_and_keeps_c1_data_and_pgvector(migra
 
     # 6. Re-upgrade to head: all four tables return EMPTY, identical in structure.
     run_alembic("upgrade", "head")
-    assert current_revision(engine) == MIGRATION_7
+    assert current_revision(engine) == MIGRATION_8
     assert set(ALL_CHAT_TABLES) <= table_names(engine)
     for table in ALL_CHAT_TABLES:
         assert row_count(engine, table) == 0, table               # nothing came back
@@ -477,6 +542,26 @@ def test_c7_round_trip_drops_only_chat_data_and_keeps_c1_data_and_pgvector(migra
             conn.execute(insert_attempt, {"r": request_id, "charge": 50})
         transaction.rollback()
     assert wrong_charge.value.orig.diag.constraint_name == "ck_chat_request_attempts_charge_consistent"
+
+    # The re-created #8 constraints accept a rejected zero-charge attempt (control) and
+    # reject a rejected attempt charged the reservation (charge_consistent alone).
+    insert_rejected = text(
+        "INSERT INTO chat_request_attempts (request_id, attempt_number, status, reserved_tokens, "
+        "charged_tokens, llm_started_at, finished_at, error_code) "
+        "VALUES (:r, 1, 'rejected', 100, :charge, now(), now(), 'provider_rejected')")
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        request_id = conn.execute(insert_request, params).scalar_one()
+        conn.execute(insert_rejected, {"r": request_id, "charge": 0})
+        transaction.rollback()
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        request_id = conn.execute(insert_request, params).scalar_one()
+        with pytest.raises(IntegrityError) as rejected_charge:
+            conn.execute(insert_rejected, {"r": request_id, "charge": 100})
+        transaction.rollback()
+    assert rejected_charge.value.orig.diag.constraint_name == (
+        "ck_chat_request_attempts_charge_consistent")
 
     for table in ALL_CHAT_TABLES:
         assert row_count(engine, table) == 0, table

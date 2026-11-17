@@ -18,7 +18,7 @@ from app.core.database import Base
 class ChatRequestAttempt(Base):
     """One execution attempt of a chat request, and the quota ledger row for it.
 
-    status is the attempt's outcome (7 values). charged_tokens is NULL only while the
+    status is the attempt's outcome (8 values). charged_tokens is NULL only while the
     attempt is running; every other status has a non-NULL charge (see the CHECKs).
     llm_started_at is committed BEFORE the Groq call: NULL proves no call was issued.
     Every CHECK below is written so it can never evaluate to NULL (PostgreSQL accepts
@@ -40,7 +40,7 @@ class ChatRequestAttempt(Base):
         ),
         CheckConstraint(
             "status IN ('running', 'succeeded', 'failed_before_call', 'failed_with_usage', "
-            "'rate_limited', 'uncertain', 'abandoned')",
+            "'rate_limited', 'uncertain', 'abandoned', 'rejected')",
             name="ck_chat_request_attempts_status_valid",
         ),
         CheckConstraint(
@@ -67,8 +67,8 @@ class ChatRequestAttempt(Base):
         ),
         CheckConstraint(
             "status = 'running' "
-            "OR (status IN ('succeeded', 'failed_with_usage', 'rate_limited', 'uncertain') "
-            "AND llm_started_at IS NOT NULL) "
+            "OR (status IN ('succeeded', 'failed_with_usage', 'rate_limited', 'uncertain', "
+            "'rejected') AND llm_started_at IS NOT NULL) "
             "OR (status IN ('failed_before_call', 'abandoned') AND llm_started_at IS NULL)",
             name="ck_chat_request_attempts_llm_started_consistent",
         ),
@@ -87,7 +87,7 @@ class ChatRequestAttempt(Base):
             "OR (status = 'failed_with_usage' AND prompt_tokens IS NOT NULL "
             "AND completion_tokens IS NOT NULL AND charged_tokens IS NOT NULL "
             "AND charged_tokens = prompt_tokens + completion_tokens) "
-            "OR (status IN ('failed_before_call', 'abandoned', 'rate_limited') "
+            "OR (status IN ('failed_before_call', 'abandoned', 'rate_limited', 'rejected') "
             "AND prompt_tokens IS NULL AND completion_tokens IS NULL "
             "AND charged_tokens IS NOT NULL AND charged_tokens = 0) "
             "OR (status = 'uncertain' AND prompt_tokens IS NULL AND completion_tokens IS NULL "
@@ -136,7 +136,9 @@ class ChatRequestAttempt(Base):
     charged_tokens = Column(Integer, nullable=True)
     # Fixed reason codes only; NULL for running and succeeded attempts.
     error_code = Column(String, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     # Written and committed before the Groq call; selects the UTC accounting day.
     llm_started_at = Column(DateTime(timezone=True), nullable=True)
     # Set when the attempt leaves 'running'.

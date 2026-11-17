@@ -23,6 +23,11 @@ Locks. The request row is locked first, then the attempt row (by the fenced UPDA
 the conversation row. ``start_attempt`` and ``fail_request`` also lock the request row first,
 so publish, fail and start for one request run one after another.
 
+``reject_and_fail_request`` is the only way to settle a provider-rejected attempt (charge 0):
+in ONE transaction it checks owner, request and attempt together, settles the attempt through
+the same fence, and fails the request with ``_set_failed`` (also used by ``fail_request``).
+Same lock order. No committed state can hold a rejected attempt with an in-progress request.
+
 Not done here: choosing titles, citations, size limits (C9/C10); checking conversation
 ownership BEFORE the provider call (the chat flow should, to avoid wasting tokens; this
 module checks again at publish); settling the attempt when the conversation turns out to be
@@ -46,6 +51,7 @@ from app.models.chat_request import ChatRequest
 from app.models.chat_request_attempt import ChatRequestAttempt
 from app.rag.chat_attempt_lifecycle import (
     TransitionOutcome,
+    settle_rejected_in_transaction,
     settle_succeeded_in_transaction,
     validate_optional_usage,
 )
@@ -57,10 +63,13 @@ __all__ = [
     "FinalizationArgumentError",
     "PublishOutcome",
     "PublishResult",
+    "RejectOutcome",
+    "RejectResult",
     "RequestResult",
     "fail_request",
     "get_request_result",
     "publish_success",
+    "reject_and_fail_request",
 ]
 
 # Same format as the attempt error codes (chat_attempt_lifecycle); a test keeps them equal.
@@ -96,6 +105,25 @@ class FailOutcome(str, Enum):
     NOT_FOUND = "not_found"
     ALREADY_FINALIZED = "already_finalized"  # current_status says which
     ATTEMPT_RUNNING = "attempt_running"  # settle or expire the running attempt first
+
+
+class RejectOutcome(str, Enum):
+    REJECTED = (
+        "rejected"  # attempt settled (charge 0) and request failed, in one commit
+    )
+    REQUEST_NOT_FOUND = (
+        "request_not_found"  # no such owner/request/attempt triple; nothing written
+    )
+    ALREADY_FINALIZED = "already_finalized"  # request not in progress; nothing written
+    NOT_RUNNING = "not_running"  # fence: the attempt is already settled or expired
+    LEASE_EXPIRED = "lease_expired"  # fence: running but past its lease
+    WRONG_PHASE = "wrong_phase"  # fence: the attempt never recorded llm_started_at
+
+
+@dataclass(frozen=True, slots=True)
+class RejectResult:
+    outcome: RejectOutcome
+    current_status: str | None = None  # ALREADY_FINALIZED only
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +373,17 @@ def fail_request(
         ).scalar_one()
         if running:
             return FailResult(FailOutcome.ATTEMPT_RUNNING)
+        _set_failed(db, request_id, error_code)
+        return FailResult(FailOutcome.FAILED)
+
+
+def _set_failed(db: Session, request_id: int, error_code: str) -> bool:
+    """Mark an in-progress request failed, inside the caller's transaction.
+
+    The one place that decides what a failed request looks like. The caller must already
+    hold the request row lock. Returns whether a row was updated.
+    """
+    return (
         db.execute(
             update(ChatRequest)
             .where(ChatRequest.id == request_id, ChatRequest.status == "in_progress")
@@ -353,8 +392,57 @@ def fail_request(
                 error_code=error_code,
                 completed_at=func.clock_timestamp(),
             )
-        )
-        return FailResult(FailOutcome.FAILED)
+            .returning(ChatRequest.id)
+        ).first()
+        is not None
+    )
+
+
+def reject_and_fail_request(
+    db: Session, owner_id: int, request_id: int, attempt_id: int, error_code: str
+) -> RejectResult:
+    """Settle a provider-rejected attempt (charge 0) and fail its request, atomically.
+
+    One transaction, request row locked first and the attempt row second (the same order as
+    ``publish_success``, ``fail_request`` and ``start_attempt``):
+
+    1. The request must be this owner's AND own this attempt (one joined, locking SELECT;
+       a mismatch is ``REQUEST_NOT_FOUND`` and nothing is written).
+    2. The request must still be in progress, else ``ALREADY_FINALIZED``.
+    3. The attempt is settled through the C8.4 fenced update (running, lease live, started);
+       a stale, expired or taken-over worker stops here with no writes.
+    4. The request is marked failed with the same code.
+
+    Either both rows change and commit together, or neither does. The same ``error_code``
+    is stored on the attempt and the request (it is what a replay returns).
+    """
+    _check_id("owner_id", owner_id)
+    _check_id("request_id", request_id)
+    _check_id("attempt_id", attempt_id)
+    _check_error_code(error_code)
+    with db.begin():
+        status = db.execute(
+            select(ChatRequest.status)
+            .join(attempt, attempt.request_id == ChatRequest.id)
+            .where(
+                ChatRequest.id == request_id,
+                ChatRequest.owner_id == owner_id,
+                attempt.id == attempt_id,
+            )
+            .with_for_update(of=ChatRequest)
+        ).scalar_one_or_none()
+        if status is None:
+            return RejectResult(RejectOutcome.REQUEST_NOT_FOUND)
+        if status != "in_progress":
+            return RejectResult(RejectOutcome.ALREADY_FINALIZED, status)
+        settled = settle_rejected_in_transaction(db, attempt_id, error_code)
+        if settled is not TransitionOutcome.APPLIED:
+            if settled is TransitionOutcome.NOT_FOUND:
+                return RejectResult(RejectOutcome.REQUEST_NOT_FOUND)
+            return RejectResult(RejectOutcome(settled.value))
+        if not _set_failed(db, request_id, error_code):
+            raise RuntimeError("request could not be failed")  # rolls everything back
+        return RejectResult(RejectOutcome.REJECTED)
 
 
 def get_request_result(

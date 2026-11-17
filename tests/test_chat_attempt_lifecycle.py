@@ -27,6 +27,7 @@ from app.rag.chat_attempt_lifecycle import (
     mark_llm_started,
     mark_rate_limited,
     mark_uncertain,
+    settle_rejected_in_transaction,
     settle_succeeded_in_transaction,
 )
 from app.rag.chat_attempt_start import AttemptStartOutcome, start_attempt
@@ -81,6 +82,13 @@ def complete_succeeded(db, attempt_id, prompt_tokens=None, completion_tokens=Non
         )
 
 
+def complete_rejected(db, attempt_id, error_code):
+    """Test stand-in: settle a rejection in its own transaction (production: only inside
+    reject_and_fail_request, see test_chat_request_finalization.py)."""
+    with db.begin():
+        return settle_rejected_in_transaction(db, attempt_id, error_code)
+
+
 def call(function, *args, **kwargs):
     with SessionLocal() as db:
         return function(db, *args, **kwargs)
@@ -131,6 +139,7 @@ WORKER_CALLS = {
     "fail_with_usage": lambda a: call(fail_with_usage, a, "bad_output", 7, 3),
     "uncertain": lambda a: call(mark_uncertain, a, "timeout"),
     "rate_limited": lambda a: call(mark_rate_limited, a, "http_429"),
+    "rejected": lambda a: call(complete_rejected, a, "provider_rejected"),
 }
 
 
@@ -257,12 +266,43 @@ def test_rate_limited_charges_nothing(owner):
     assert (r.status, r.charged_tokens, r.error_code) == ("rate_limited", 0, "http_429")
 
 
+def test_rejected_charges_nothing_and_records_no_usage(owner):
+    attempt_id, _ = new_attempt(owner, reserved=500, started=True)
+    assert call(complete_rejected, attempt_id, "provider_rejected") is APPLIED
+    r = row_named(attempt_id)
+    assert (r.status, r.charged_tokens, r.error_code) == (
+        "rejected",
+        0,
+        "provider_rejected",
+    )
+    assert (r.prompt_tokens, r.completion_tokens, r.lease_expires_at) == (
+        None,
+        None,
+        None,
+    )
+    assert r.llm_started_at is not None and r.finished_at is not None
+    assert call(get_daily_usage, owner, datetime.now(UTC).date()).total_tokens == 0
+
+
+def row_named(attempt_id):
+    return execute(
+        "SELECT * FROM chat_request_attempts WHERE id = :i", i=attempt_id
+    ).one()
+
+
 # ---------------------------------------------------------------- phases
 
 
 @pytest.mark.parametrize(
     "name",
-    ["succeeded", "succeeded_no_usage", "fail_with_usage", "uncertain", "rate_limited"],
+    [
+        "succeeded",
+        "succeeded_no_usage",
+        "fail_with_usage",
+        "uncertain",
+        "rate_limited",
+        "rejected",
+    ],
 )
 def test_started_only_transitions_reject_an_unstarted_attempt(owner, name):
     attempt_id, _ = new_attempt(owner)
@@ -283,7 +323,7 @@ def test_unstarted_only_transitions_reject_a_started_attempt(owner, name):
 
 
 @pytest.mark.parametrize(
-    "settle", ["succeeded", "uncertain", "rate_limited", "fail_with_usage"]
+    "settle", ["succeeded", "uncertain", "rate_limited", "fail_with_usage", "rejected"]
 )
 def test_a_settled_attempt_cannot_be_changed_by_any_stale_worker(owner, settle):
     attempt_id, _ = new_attempt(owner, started=True)
@@ -443,12 +483,13 @@ def test_full_flow_charge_is_what_the_quota_sees(owner):
 
 def test_concurrent_settlements_of_one_attempt_apply_exactly_once(owner):
     attempt_id, _ = new_attempt(owner, reserved=500, started=True)
-    barrier = threading.Barrier(8)
+    barrier = threading.Barrier(10)
     calls = [
         lambda db: complete_succeeded(db, attempt_id, 10, 5),
         lambda db: mark_uncertain(db, attempt_id, "timeout"),
         lambda db: mark_rate_limited(db, attempt_id, "http_429"),
         lambda db: fail_with_usage(db, attempt_id, "bad_output", 1, 1),
+        lambda db: complete_rejected(db, attempt_id, "provider_rejected"),
     ] * 2
 
     def task(i):
@@ -456,12 +497,18 @@ def test_concurrent_settlements_of_one_attempt_apply_exactly_once(owner):
             barrier.wait(timeout=10)
             return calls[i](db)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        outcomes = list(pool.map(task, range(8)))
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        outcomes = list(pool.map(task, range(10)))
     assert outcomes.count(APPLIED) == 1
-    assert outcomes.count(TransitionOutcome.NOT_RUNNING) == 7
+    assert outcomes.count(TransitionOutcome.NOT_RUNNING) == 9
     final = execute("SELECT status FROM chat_request_attempts").scalar_one()
-    assert final in {"succeeded", "uncertain", "rate_limited", "failed_with_usage"}
+    assert final in {
+        "succeeded",
+        "uncertain",
+        "rate_limited",
+        "failed_with_usage",
+        "rejected",
+    }
 
 
 def race_worker_against_expiry(attempt_id, request_id, lease_ms, jitter_ms):
@@ -551,6 +598,7 @@ def test_invalid_attempt_and_request_ids_are_rejected(bad):
         (fail_with_usage, ("code", 1, 1)),
         (mark_uncertain, ("code",)),
         (mark_rate_limited, ("code",)),
+        (complete_rejected, ("code",)),
         (expire_stale_attempt, ()),
     ):
         with pytest.raises(AttemptLifecycleArgumentError):
@@ -577,7 +625,12 @@ def test_invalid_attempt_and_request_ids_are_rejected(bad):
 def test_invalid_error_codes_are_rejected(owner, bad):
     attempt_id, _ = new_attempt(owner, started=True)
     before = row(attempt_id)
-    for function in (mark_uncertain, mark_rate_limited, fail_before_call):
+    for function in (
+        mark_uncertain,
+        mark_rate_limited,
+        fail_before_call,
+        complete_rejected,
+    ):
         with pytest.raises(AttemptLifecycleArgumentError):
             call(function, attempt_id, bad)
     with pytest.raises(AttemptLifecycleArgumentError):
@@ -638,6 +691,12 @@ def test_every_transition_commits_and_leaves_no_open_transaction(owner):
             is ExpireOutcome.NOTHING_TO_EXPIRE
         )
         assert not db.in_transaction()
+
+
+def test_standalone_rejection_is_not_public():
+    assert "settle_rejected_in_transaction" not in lifecycle_module.__all__
+    assert not hasattr(lifecycle_module, "mark_rejected")
+    assert not hasattr(lifecycle_module, "complete_rejected")
 
 
 def test_standalone_success_settlement_is_not_public():

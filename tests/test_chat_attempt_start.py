@@ -314,6 +314,26 @@ def test_only_rate_limited_attempts_count_towards_the_cap(owner):
     assert start(owner, rid).outcome is AttemptStartOutcome.STARTED
 
 
+def test_a_rejected_attempt_does_not_count_towards_the_cap(owner):
+    # Seeded directly: in production a rejection also fails its request (C9.4a). This pins
+    # that the 429 cap counts 'rate_limited' attempts only.
+    rid = make_request(owner)
+    add_attempt(rid, "rate_limited", number=1, charged=0)
+    add_attempt(rid, "rejected", number=2, charged=0)
+    assert start(owner, rid).outcome is AttemptStartOutcome.STARTED
+
+
+def test_a_rejected_attempt_consumes_no_quota(owner):
+    done = make_request(owner)
+    add_attempt(
+        done, "rejected", number=1, reserved=999, charged=0
+    )  # charged 0, whatever reserved
+    rid = make_request(owner)
+    assert (
+        start(owner, rid, reserved_tokens=LIMIT).outcome is AttemptStartOutcome.STARTED
+    )
+
+
 def test_the_cap_is_per_request(owner):
     capped = make_request(owner)
     add_attempt(capped, "rate_limited", number=1, charged=0)
