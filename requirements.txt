@@ -38,3 +38,5 @@ tokenizers==0.23.3
 huggingface-hub==2.4.0
 safetensors==0.8.0
 numpy==2.5.4
+groq==1.7.0
+langgraph==1.2.22
