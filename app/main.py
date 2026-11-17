@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from app.api import health, documents, auth, indexing
 from app.core.middleware import RequestLoggingMiddleware
-from app.models import chunk, document, user
+from app.models import chat_request, chat_request_attempt, chunk, conversation, document, message, user
 from app.core.config import settings 
 
 app = FastAPI(title=settings.app_name)
